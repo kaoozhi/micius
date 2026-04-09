@@ -1,3 +1,5 @@
+mod config;
+
 pub mod proto {
     pub mod storage {
         pub mod v1 {
