@@ -1,4 +1,6 @@
 mod config;
+mod types;
+mod wal;
 
 pub mod proto {
     pub mod storage {
