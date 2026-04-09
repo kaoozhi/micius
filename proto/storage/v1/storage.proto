@@ -1,0 +1,102 @@
+syntax = "proto3";
+
+package storage.v1;
+
+option go_package = "github.com/kaoozhi/micius/gen/storage/v1;storagev1";
+
+// StorageService is the sole boundary between Go services (clients)
+// and the Rust storage engine (server). Go services never implement
+// this interface. The Rust engine never calls external services.
+service StorageService {
+  // Append writes a batch of data points durably (WAL fsync) and
+  // returns the WAL sequence number assigned to the batch.
+  // The caller must treat the sequence as an opaque monotonic token.
+  rpc Append(AppendRequest) returns (AppendResponse);
+
+  // Query streams data points matching the given metric name, tag
+  // filters, and time range. Each streamed message carries one point.
+  // The stream closes normally when all matching points are delivered,
+  // or with a status error if the engine encounters a read failure.
+  rpc Query(QueryRequest) returns (stream QueryResponse);
+
+  // Compact triggers an immediate size-tiered compaction pass rather
+  // than waiting for the background interval. Used by tests and ops tooling.
+  rpc Compact(CompactRequest) returns (CompactResponse);
+
+  // Snapshot persists the in-memory chunk index to disk. Used by the
+  // replication layer in Phase 4 and for graceful shutdown.
+  rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
+}
+
+// ── Write path ────────────────────────────────────────────────────────────────
+
+message AppendRequest {
+  // One or more data points to write atomically to the WAL.
+  // An empty batch is valid and returns sequence 0.
+  repeated DataPoint points = 1;
+}
+
+message AppendResponse {
+  // WAL sequence number assigned to this batch.
+  // Monotonically increasing. Use for ordering guarantees, not idempotency.
+  uint64 sequence = 1;
+}
+
+// DataPoint is a single timestamped measurement belonging to a series
+// identified by (metric_name, tags).
+message DataPoint {
+  string metric_name = 1;
+
+  // Tag set — unordered. Rust side normalizes to BTreeMap for canonical ordering.
+  // Never encode as repeated key-value pairs — always use map<string, string>.
+  map<string, string> tags = 2;
+
+  // Unix nanoseconds. sint64 encodes negative values (pre-epoch) efficiently.
+  sint64 timestamp_ns = 3;
+
+  double value = 4;
+}
+
+// ── Read path ─────────────────────────────────────────────────────────────────
+
+message QueryRequest {
+  // Metric name to query. Required — empty string returns no results.
+  string metric_name = 1;
+
+  // Tag equality filters. Only series whose tag set is a superset of
+  // these key-value pairs are returned. Empty map = all series for metric_name.
+  map<string, string> tag_filters = 2;
+
+  // Inclusive time range in unix nanoseconds.
+  // time_start_ns == 0 means "from the beginning of time".
+  // time_end_ns   == 0 means "up to now".
+  sint64 time_start_ns = 3;
+  sint64 time_end_ns   = 4;
+}
+
+// One streamed point. Keeping this flat (no nested DataPoint) avoids
+// an extra allocation per point during streaming decode on the Go side.
+message QueryResponse {
+  sint64 timestamp_ns = 1;
+  double value        = 2;
+}
+
+// ── Maintenance ───────────────────────────────────────────────────────────────
+
+message CompactRequest {
+  // Reserved for future: series_id filter, max_chunks hint, etc.
+}
+
+message CompactResponse {
+  // Number of chunk files merged in this pass.
+  uint32 chunks_merged = 1;
+}
+
+message SnapshotRequest {
+  // Reserved for future: snapshot label, replication target, etc.
+}
+
+message SnapshotResponse {
+  // Absolute path to the written index snapshot file on the server host.
+  string snapshot_path = 1;
+}

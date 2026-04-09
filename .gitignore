@@ -1,0 +1,20 @@
+# Rust
+storage-engine/target/
+
+# Go
+ingestion/vendor/
+query/vendor/
+*.test
+
+# Generated protobuf code
+gen/
+
+# Environment
+.env
+
+# macOS
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
