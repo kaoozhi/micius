@@ -69,7 +69,7 @@ impl WalWriter {
         hasher.update(&payload);
         let checksum = hasher.finalize();
 
-        // Frame: [length: u32 LE][checksum: u32 LE][payload]
+        // Frame: [length: u32 LE 4 bytes][checksum: u32 LE 4 bytes][payload "length" bytes]
         // Length prefix allows the recovery reader to know how many bytes
         // to read. A mismatch between length and available bytes signals
         // a torn write — recovery stops at that boundary.

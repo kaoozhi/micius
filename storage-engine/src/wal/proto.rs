@@ -29,3 +29,14 @@ impl From<&DataPoint> for WalDataPoint {
         }
     }
 }
+
+impl From<WalDataPoint> for DataPoint {
+    fn from(pt: WalDataPoint) -> Self {
+        DataPoint {
+            metric_name: pt.metric_name,
+            tags: pt.tags,
+            timestamp_ns: pt.timestamp_ns,
+            value: pt.value,
+        }
+    }
+}
