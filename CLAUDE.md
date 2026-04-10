@@ -105,11 +105,14 @@ micius/
 ├── storage-engine/                    # Rust — WAL, chunk store, gRPC server
 │   ├── src/
 │   │   ├── main.rs
+│   │   ├── lib.rs                     # library root — re-exports modules
+│   │   ├── config.rs                  # StorageConfig from env vars
 │   │   ├── types.rs                   # DataPoint, SeriesKey, SeriesId, ChunkId
 │   │   ├── wal/
 │   │   │   ├── mod.rs
-│   │   │   ├── writer.rs              # append + fsync
-│   │   │   └── recovery.rs            # replay on startup
+│   │   │   ├── writer.rs              # append + fsync + segment rotation
+│   │   │   ├── proto.rs               # WalEntry, WalDataPoint prost structs
+│   │   │   └── recovery.rs            # replay on startup (not yet implemented)
 │   │   ├── memtable/
 │   │   │   └── mod.rs                 # BTreeMap buffer, flush threshold
 │   │   ├── chunk/
@@ -124,6 +127,8 @@ micius/
 │   │   │   └── mod.rs                 # size-tiered background worker
 │   │   └── server/
 │   │       └── mod.rs                 # tonic gRPC server
+│   ├── tests/
+│   │   └── wal_test.rs                # WAL integration tests
 │   ├── build.rs                       # prost-build code generation
 │   └── Cargo.toml
 ├── ingestion/                         # Go — adapters, write buffer, gRPC client
@@ -209,7 +214,7 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 
 ### Phase completion
 
-- [ ] **Phase 1** — Rust storage engine
+- [~] **Phase 1** — Rust storage engine
 - [ ] **Phase 2** — Go ingestion layer
 - [ ] **Phase 3** — Go query and alert layer
 

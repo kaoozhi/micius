@@ -994,6 +994,7 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tonic",

@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tokio::fs::{File, OpenOptions};
@@ -90,19 +88,36 @@ impl WalWriter {
 
         // Rotate to a new segment if the size threshold is exceeded.
         // New writes after this point go into the fresh segment.
-        if self.current_size > self.max_segment_bytes {
-            self.current_segment += 1;
-            let path = segment_path(&self.wal_dir, self.current_segment);
-            self.file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .await
-                .with_context(|| format!("failed to open new WAL segment {:?}", path))?;
-            self.current_size = 0;
+        if self.current_size >= self.max_segment_bytes {
+            self.rotate().await?;
         }
 
         Ok(self.current_seq)
+    }
+
+    async fn rotate(&mut self) -> Result<()> {
+        self.current_segment += 1;
+        let path = self.current_segment_path();
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+            .with_context(|| format!("failed to open new WAL segment {:?}", path))?;
+        self.current_size = 0;
+        Ok(())
+    }
+
+    /// Returns the current WAL sequence number.
+    /// Used by the replication layer to track what has been shipped
+    /// to follower nodes.
+    pub fn current_sequence(&self) -> Sequence {
+        self.current_seq
+    }
+
+    /// Returns the path of the current WAL segment.
+    pub fn current_segment_path(&self) -> PathBuf {
+        segment_path(&self.wal_dir, self.current_segment)
     }
 }
 
