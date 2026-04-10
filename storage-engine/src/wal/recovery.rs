@@ -59,8 +59,8 @@ pub async fn recover(wal_dir: &Path) -> Result<RecoveryResult> {
             // Parse the checksum
             let stored_checksum = u32::from_le_bytes(buf[cursor + 4..cursor + 8].try_into()?);
             cursor += 8;
-            // Get the checksum of recovered payload
 
+            // Get the checksum of recovered payload
             let payload = &buf[cursor..cursor + stored_length];
             cursor += stored_length;
             let mut hasher = Hasher::new();
