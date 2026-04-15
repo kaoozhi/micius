@@ -17,7 +17,9 @@ pub struct DataPoint {
 /// BTreeMap is used for tags rather than HashMap to guarantee a
 /// deterministic byte representation for hashing and bloom filters.
 /// HashMap iteration order is not stable across runs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Ord, PartialOrd, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SeriesKey {
     pub metric_name: String,
     pub tags: BTreeMap<String, String>,
