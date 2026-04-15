@@ -930,7 +930,7 @@ any locking on the file itself.
 ┌─────────────────────────────────────────────────────┐
 │ FILE HEADER — 40 bytes                              │
 │                                                     │
-│  magic         : u32   = 0x48454C58  ("HELX")       │
+│  magic         : u32   = 0x4D494349  ("MICI")       │
 │  version       : u8    = 1                          │
 │  _padding      : [u8;3]                             │
 │  chunk_id      : u64                                │
@@ -987,7 +987,7 @@ any locking on the file itself.
 ```rust
 // src/chunk/format.rs
 
-pub const MAGIC: u32   = 0x48454C58;    // "HELX" in ASCII
+pub const MAGIC: u32   = 0x4D494349;    // "MICI" in ASCII
 pub const VERSION: u8  = 1;
 pub const HEADER_SIZE: usize = 40;
 

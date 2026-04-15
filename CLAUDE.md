@@ -373,7 +373,7 @@ tracing::info!(
 ### Storage engine (Rust)
 - **Do not** use `unwrap()` or `expect()` outside of tests
 - **Do not** add any database client dependency — the engine writes to local filesystem only
-- **Do not** change the chunk file magic bytes (`0x48454C58`) — breaks existing chunk files
+- **Do not** change the chunk file magic bytes (`0x4D494349`) — breaks existing chunk files
 - **Do not** implement the gRPC client in Rust — Go services are always the gRPC clients
 - **Do not** store series metadata in the chunk files themselves — that belongs in the chunk index
 

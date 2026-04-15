@@ -425,7 +425,7 @@ impl Memtable {
 ```
 ┌──────────────────────────────────────────┐
 │ HEADER (32 bytes)                        │
-│   magic:         u32  = 0x48454C58       │  "HELX"
+│   magic:         u32  = 0x4D494349       │  "MICI"
 │   version:       u8   = 1                │
 │   _padding:      u8   × 3                │
 │   time_start_ns: i64                     │
