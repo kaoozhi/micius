@@ -61,11 +61,15 @@
 // ├─────────────────────────────────────────────────────┤
 // │ FOOTER                                              │
 // │                                                     │
-// │  bloom_len    : u32                                 │
-// │  bloom_data   : [u8; bloom_len]                     │
+// │  bloom_bitmap_bits : u64  number of bits in bitmap  │
+// │  bloom_k_num       : u32  number of hash functions  │
+// │  bloom_sip_keys    : [u64;4]  two SipHash key pairs │
+// │  bloom_len         : u32  byte length of bitmap     │
+// │  bloom_data        : [u8; bloom_len]                │
 // │    → bloom filter over all series_key bytes in      │
 // │      this chunk. Used to skip chunks that           │
 // │      definitely do not contain a queried series.    │
+// │      All fields required for Bloom::from_existing() │
 // │                                                     │
 // │  file_checksum : u32                                │
 // │    → CRC32 of all bytes from start of file header   │
@@ -193,15 +197,7 @@ impl ChunkWriter {
         //          = 40 + key_len
         let dir_size: usize = encoded
             .iter()
-            .map(|s| {
-                size_of::<u32>() /* key_len */
-                + s.key.to_bytes().len() /*key_bytes*/
-                + size_of::<u32>() /* size of entry_count*/
-                + size_of::<u64>() /* size of ts_offset */
-                + size_of::<u64>() /* size of val_offset*/
-                + size_of::<f64>() /* size of max val*/
-                + size_of::<f64>() /* size of min val*/
-            })
+            .map(|s| DIR_ENTRY_FIXED_SIZE + s.key.to_bytes().len())
             .sum();
         let mut current_offset = HEADER_SIZE + dir_size;
         let mut offsets: Vec<(u64, u64)> = Vec::new();
@@ -256,7 +252,16 @@ impl ChunkWriter {
         }
 
         // Footer — bloom filter
+        let bloom_bitmap_bits = bloom.number_of_bits();
+        let bloom_k_num = bloom.number_of_hash_functions();
+        let bloom_sip_keys = bloom.sip_keys();
         let bloom_bytes = bloom.bitmap();
+        buf.extend_from_slice(&bloom_bitmap_bits.to_le_bytes());
+        buf.extend_from_slice(&bloom_k_num.to_le_bytes());
+        for (k0, k1) in &bloom_sip_keys {
+            buf.extend_from_slice(&k0.to_le_bytes());
+            buf.extend_from_slice(&k1.to_le_bytes());
+        }
         buf.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bloom_bytes);
 
