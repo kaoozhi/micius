@@ -37,6 +37,7 @@ prometheus           = { version = "0.13", features = ["process"] }
 uuid           = { version = "1", features = ["v4"] }
 bytes          = "1"
 tempfile = "3.27.0"
+xxhash-rust = { version = "0.8.15", features = ["xxh64"] }
 
 [build-dependencies]
 tonic-build = "0.11"

@@ -109,10 +109,12 @@ fn test_double_buffer_pattern() {
     // Drain again — should only contain batch_2's data
     let batch_2 = memtable.drain();
     assert_eq!(batch_2.len(), 1);
-    let points = batch_2.get(&SeriesKey {
-        metric_name: "mem.free".to_string(),
-        tags: BTreeMap::from([("host".to_string(), "node-0".to_string())]),
-    }).expect("batch_2 series key not found");
+    let points = batch_2
+        .get(&SeriesKey {
+            metric_name: "mem.free".to_string(),
+            tags: BTreeMap::from([("host".to_string(), "node-0".to_string())]),
+        })
+        .expect("batch_2 series key not found");
     assert_eq!(points.len(), 2);
 }
 
