@@ -45,14 +45,42 @@ impl ChunkHeader {
     }
 }
 
-// Series directory entry fixed fields (excluding variable-length key bytes): 40 bytes
-//   key_len      : u32  = 4
-//   entry_count  : u32  = 4
-//   ts_col_offset: u64  = 8
-//   val_col_offset: u64 = 8
-//   min_value    : f64  = 8
-//   max_value    : f64  = 8
-pub const DIR_ENTRY_FIXED_SIZE: usize = 4 + 4 + 8 + 8 + 8 + 8;
+pub const DIR_ENTRY_FIXED_SIZE: usize =
+    U32_SIZE + U32_SIZE + U64_SIZE + U64_SIZE + F64_SIZE + F64_SIZE; // 40
+
+// Primitive type sizes — use these everywhere instead of raw integer literals.
+pub const U32_SIZE: usize = 4;
+pub const U64_SIZE: usize = 8;
+pub const I64_SIZE: usize = 8;
+pub const F64_SIZE: usize = 8;
+
+// Column data prefix — each compressed column is preceded by its u32 byte length.
+pub const COL_LEN_SIZE: usize = U32_SIZE;
+
+// Series directory entry fixed fields (excluding variable-length key bytes):
+//   key_len       : u32 = U32_SIZE
+//   entry_count   : u32 = U32_SIZE
+//   ts_col_offset : u64 = U64_SIZE
+//   val_col_offset: u64 = U64_SIZE
+//   min_value     : f64 = F64_SIZE
+//   max_value     : f64 = F64_SIZE
+// Note: key_bytes ([u8; key_len]) are variable and added separately at call sites.
+
+// Footer tail — the last two fields written to every chunk file.
+// Reader seeks to (file_size - FOOTER_TAIL_SIZE) to find the bloom offset.
+//   footer_offset: u64 = U64_SIZE   absolute byte offset to start of bloom data
+//   file_checksum: u32 = U32_SIZE   CRC32 over all bytes before this field
+pub const FOOTER_OFFSET_SIZE: usize = U64_SIZE;
+pub const CHECKSUM_SIZE: usize = U32_SIZE;
+pub const FOOTER_TAIL_SIZE: usize = FOOTER_OFFSET_SIZE + CHECKSUM_SIZE; // 12
+
+// Bloom footer fixed fields (at position pointed to by footer_offset):
+//   bloom_bitmap_bits: u64      = U64_SIZE
+//   bloom_k_num      : u32      = U32_SIZE
+//   bloom_sip_keys   : [u64; 4] = 4 * U64_SIZE   two SipHash key pairs
+//   bloom_len        : u32      = U32_SIZE        byte length of bitmap that follows
+pub const BLOOM_SIP_KEYS_SIZE: usize = 4 * U64_SIZE; // 32
+pub const BLOOM_HEADER_SIZE: usize = U64_SIZE + U32_SIZE + BLOOM_SIP_KEYS_SIZE + U32_SIZE; // 48
 
 /// Generate a chunk ID from the current timestamp.
 /// IDs are monotonically increasing and sort chronologically.
@@ -112,14 +140,14 @@ pub fn f64_slice_to_bytes(values: &[f64]) -> Vec<u8> {
 
 pub fn bytes_to_i64_slice(bytes: &[u8]) -> Vec<i64> {
     bytes
-        .chunks_exact(8)
+        .chunks_exact(I64_SIZE)
         .map(|b| i64::from_le_bytes(b.try_into().unwrap()))
         .collect()
 }
 
 pub fn bytes_to_f64_slice(bytes: &[u8]) -> Vec<f64> {
     bytes
-        .chunks_exact(8)
+        .chunks_exact(F64_SIZE)
         .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
         .collect()
 }

@@ -61,7 +61,7 @@ async fn write_and_read_bytes(
     (dir, result, bytes)
 }
 
-/// Parse the 40-byte chunk header from the start of the file.
+/// Parse the 48-byte chunk header from the start of the file.
 /// Returns (magic, version, chunk_id, time_start_ns, time_end_ns, series_count, total_entries).
 fn parse_header(bytes: &[u8]) -> (u32, u8, u64, i64, i64, u32, u32, u64) {
     assert!(bytes.len() >= 40, "file too small to contain header");

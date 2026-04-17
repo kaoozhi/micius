@@ -131,6 +131,7 @@ struct EncodedSeries {
 }
 
 fn build_directory_entry(s: &EncodedSeries, ts_offset: u64, val_offset: u64) -> Vec<u8> {
+    // [key_len: u32][key_bytes: [u8; key_len]][entry_count: u32][ts_offset: u64][val_offset: u64][min_val: f64][max_val: f64]
     let mut entry = Vec::with_capacity(DIR_ENTRY_FIXED_SIZE + s.key_bytes.len());
     entry.extend_from_slice(&(s.key_bytes.len() as u32).to_le_bytes());
     entry.extend_from_slice(&s.key_bytes);
