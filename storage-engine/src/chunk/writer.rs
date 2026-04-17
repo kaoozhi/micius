@@ -85,7 +85,6 @@ use bloomfilter::Bloom;
 use crc32fast::Hasher as CrcHasher;
 use lz4_flex::block::compress_prepend_size;
 use std::collections::BTreeMap;
-use std::mem::size_of;
 use std::path::PathBuf;
 
 pub struct ChunkWriter {
@@ -109,11 +108,27 @@ pub struct SeriesWriteResult {
 
 struct EncodedSeries {
     key: SeriesKey,
+    key_bytes: Vec<u8>, // cached — used in directory write and bloom filter
     entry_count: u32,
+    time_start_ns: i64,
+    time_end_ns: i64,
     ts_compressed: Vec<u8>,  // lz4-compressed delta-encoded timestamps
     val_compressed: Vec<u8>, // lz4-compressed f64 values
     min_value: f64,
     max_value: f64,
+    stats: ChunkStats,
+}
+
+fn build_directory_entry(s: &EncodedSeries, ts_offset: u64, val_offset: u64) -> Vec<u8> {
+    let mut entry = Vec::with_capacity(DIR_ENTRY_FIXED_SIZE + s.key_bytes.len());
+    entry.extend_from_slice(&(s.key_bytes.len() as u32).to_le_bytes());
+    entry.extend_from_slice(&s.key_bytes);
+    entry.extend_from_slice(&s.entry_count.to_le_bytes());
+    entry.extend_from_slice(&ts_offset.to_le_bytes());
+    entry.extend_from_slice(&val_offset.to_le_bytes());
+    entry.extend_from_slice(&s.min_value.to_le_bytes());
+    entry.extend_from_slice(&s.max_value.to_le_bytes());
+    entry
 }
 
 impl ChunkWriter {
@@ -134,12 +149,9 @@ impl ChunkWriter {
         let mut global_min_ts = i64::MAX;
         let mut global_max_ts = i64::MIN;
         let mut total_entries: u32 = 0;
-
         let mut bloom = Bloom::new_for_fp_rate(series_data.len().max(1), 0.01);
 
         for (key, points) in &series_data {
-            bloom.set(&key.to_bytes());
-
             let (timestamps, values): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
             let deltas = delta_encode(&timestamps);
             let stats = ChunkStats::from_values(&values)
@@ -155,59 +167,52 @@ impl ChunkWriter {
             let val_bytes = f64_slice_to_bytes(&values);
             let val_compressed = compress_prepend_size(&val_bytes);
 
+            let key_bytes = key.to_bytes();
+            bloom.set(&key_bytes);
             encoded.push(EncodedSeries {
                 key: key.clone(),
+                key_bytes,
                 entry_count: timestamps.len() as u32,
+                time_start_ns: *timestamps.first().unwrap(),
+                time_end_ns: *timestamps.last().unwrap(),
                 ts_compressed,
                 val_compressed,
                 min_value: stats.min_value,
                 max_value: stats.max_value,
-            });
-
-            series_results.push(SeriesWriteResult {
-                series_key: key.clone(),
-                meta: ChunkMeta {
-                    chunk_id: chunk_id,
-                    series_id: key.into(),
-                    time_start_ns: *timestamps.first().unwrap_or(&0),
-                    time_end_ns: *timestamps.last().unwrap_or(&0),
-                    file_path: file_path.clone(),
-                    size_bytes: 32 * timestamps.len(),
-                },
                 stats,
-            })
+            });
         }
 
-        // ── Pass 2: compute byte offsets ──────────────────────────────
+        // ── Pass 2: compute byte offsets and build series_results ────────
         //
-        // Calculate the byte offset where each series' columns will be
-        // written so we can fill the series directory correctly.
-        //
-        // Layout:
-        //   HEADER_SIZE
-        //   + series directory bytes (computed below)
-        //   + column data for series 0 (ts then val)
-        //   + column data for series 1
-        //   + ...
-
-        // Compute series directory size
-        // Per entry: u32(key_len) + key_bytes + u64(ts_offset) + u64(val_offset)
-        //            + u32(entry_count) + f64(min) + f64(max)
-        //          = 4 + key_len + 8 + 8 + 4 + 8 + 8
-        //          = 40 + key_len
+        // Column offsets must be absolute (from byte 0 of the file) so the
+        // reader can seek directly without knowing the directory size.
+        // Layout: HEADER_SIZE + dir_size + column data (ts+val per series).
         let dir_size: usize = encoded
             .iter()
-            .map(|s| DIR_ENTRY_FIXED_SIZE + s.key.to_bytes().len())
+            .map(|s| DIR_ENTRY_FIXED_SIZE + s.key_bytes.len())
             .sum();
         let mut current_offset = HEADER_SIZE + dir_size;
         let mut offsets: Vec<(u64, u64)> = Vec::new();
 
         for s in &encoded {
             let ts_offset = current_offset as u64;
-            current_offset += size_of::<u32>() + s.ts_compressed.len(); // u32 len prefix + timestamp data
+            current_offset += 4 + s.ts_compressed.len();
             let val_offset = current_offset as u64;
-            current_offset += size_of::<u32>() + s.val_compressed.len(); // u32 len prefix + value data
+            current_offset += 4 + s.val_compressed.len();
             offsets.push((ts_offset, val_offset));
+            series_results.push(SeriesWriteResult {
+                series_key: s.key.clone(),
+                meta: ChunkMeta {
+                    chunk_id,
+                    series_id: (&s.key).into(),
+                    time_start_ns: s.time_start_ns,
+                    time_end_ns: s.time_end_ns,
+                    file_path: file_path.clone(),
+                    size_bytes: s.ts_compressed.len() + s.val_compressed.len() + 8,
+                },
+                stats: s.stats.clone(),
+            });
         }
 
         // ── Assemble the complete file buffer ─────────────────────────
@@ -232,23 +237,16 @@ impl ChunkWriter {
 
         // series directory
         for (i, s) in encoded.iter().enumerate() {
-            let key_bytes = s.key.to_bytes();
             let (ts_off, val_off) = offsets[i];
-            buf.extend_from_slice(&(key_bytes.len() as u32).to_le_bytes()); // key len prefix
-            buf.extend_from_slice(&key_bytes); // key bytes
-            buf.extend_from_slice(&s.entry_count.to_le_bytes()); // entry_count
-            buf.extend_from_slice(&ts_off.to_le_bytes()); // ts offset
-            buf.extend_from_slice(&val_off.to_le_bytes()); // val offset
-            buf.extend_from_slice(&s.min_value.to_le_bytes());
-            buf.extend_from_slice(&s.max_value.to_le_bytes());
+            buf.extend_from_slice(&build_directory_entry(s, ts_off, val_off));
         }
 
-        // column data
+        // column data — interleaved per series: [ts_len][ts_data][val_len][val_data]
         for s in &encoded {
-            buf.extend_from_slice(&(s.ts_compressed.len() as u32).to_le_bytes()); // ts data len prefix
-            buf.extend_from_slice(&s.ts_compressed); // ts data
-            buf.extend_from_slice(&(s.val_compressed.len() as u32).to_le_bytes()); // val data len prefix
-            buf.extend_from_slice(&s.val_compressed); // val data
+            buf.extend_from_slice(&(s.ts_compressed.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&s.ts_compressed);
+            buf.extend_from_slice(&(s.val_compressed.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&s.val_compressed);
         }
 
         // Footer — bloom filter
