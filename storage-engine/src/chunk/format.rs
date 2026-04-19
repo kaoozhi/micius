@@ -1,7 +1,8 @@
+use crate::types::*;
 pub const MAGIC: u32 = 0x4D494349; // "MICI" in ASCII
 pub const VERSION: u8 = 1;
 
-// Header layout (40 bytes total):
+// Header layout (48 bytes total):
 //   magic        : u32 = 4
 //   version      : u8  = 1
 //   _padding      : [u8; 3] = 3
@@ -10,7 +11,39 @@ pub const VERSION: u8 = 1;
 //   time_end_ns  : i64 = 8
 //   series_count : u32 = 4
 //   total_entries: u32 = 4
-pub const HEADER_SIZE: usize = 40;
+//   col_data_offset: u64 = 8
+pub const HEADER_SIZE: usize = 48;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChunkHeader {
+    pub magic: u32,           // 4 bytes — 0x4D494349 ("MICI")
+    pub version: u8,          // 1 byte
+    pub _padding: [u8; 3],    // 3 bytes — alignment to 8-byte boundary
+    pub chunk_id: ChunkId,    // 8 bytes
+    pub time_start_ns: i64,   // 8 bytes — earliest timestamp in file
+    pub time_end_ns: i64,     // 8 bytes — latest timestamp in file
+    pub series_count: u32,    // 4 bytes
+    pub total_entries: u32,   // 4 bytes
+    pub col_data_offset: u64, // 8 bytes
+} // total: 48 bytes
+
+impl ChunkHeader {
+    // fn new(&mut self, chunk_id)
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes: Vec<u8> = Vec::with_capacity(HEADER_SIZE);
+        bytes.extend_from_slice(&self.magic.to_le_bytes());
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        bytes.extend_from_slice(&self._padding);
+        bytes.extend_from_slice(&self.chunk_id.to_le_bytes());
+        bytes.extend_from_slice(&self.time_start_ns.to_le_bytes());
+        bytes.extend_from_slice(&self.time_end_ns.to_le_bytes());
+        bytes.extend_from_slice(&self.series_count.to_le_bytes());
+        bytes.extend_from_slice(&self.total_entries.to_le_bytes());
+        bytes.extend_from_slice(&self.col_data_offset.to_le_bytes());
+
+        bytes
+    }
+}
 
 // Series directory entry fixed fields (excluding variable-length key bytes): 40 bytes
 //   key_len      : u32  = 4

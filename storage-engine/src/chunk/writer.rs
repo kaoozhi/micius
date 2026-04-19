@@ -20,17 +20,21 @@
 
 // ```
 // ┌─────────────────────────────────────────────────────┐
-// │ FILE HEADER — 40 bytes                              │
+// │ FILE HEADER — 48 bytes                              │
 // │                                                     │
-// │  magic         : u32   = 0x4D494349  ("MICI")       │
-// │  version       : u8    = 1                          │
-// │  _padding      : [u8;3]                             │
-// │  chunk_id      : u64                                │
-// │  time_start_ns : i64   earliest timestamp in file   │
-// │  time_end_ns   : i64   latest timestamp in file     │
-// │  series_count  : u32   number of series in file     │
-// │  total_entries : u32   total data points across     │
-// │                        all series                   │
+// │  magic           : u32   = 0x4D494349  ("MICI")     │
+// │  version         : u8    = 1                        │
+// │  _padding        : [u8;3]                           │
+// │  chunk_id        : u64                              │
+// │  time_start_ns   : i64   earliest timestamp         │
+// │  time_end_ns     : i64   latest timestamp           │
+// │  series_count    : u32   number of series           │
+// │  total_entries   : u32   total data points          │
+// │  col_data_offset : u64   absolute byte offset to    │
+// │                          start of column data.      │
+// │                          Skips directory scan on    │
+// │                          reads that go straight to  │
+// │                          column data.               │
 // ├─────────────────────────────────────────────────────┤
 // │ SERIES DIRECTORY — series_count entries             │
 // │                                                     │
@@ -71,10 +75,17 @@
 // │      definitely do not contain a queried series.    │
 // │      All fields required for Bloom::from_existing() │
 // │                                                     │
+// │  footer_offset : u64                                │
+// │    → absolute byte offset to the start of this      │
+// │      footer (i.e. to bloom_bitmap_bits). Written    │
+// │      as the last 12 bytes: [footer_offset u64]      │
+// │      [file_checksum u32]. Reader seeks to           │
+// │      file_size - 12, reads offset, jumps to bloom.  │
+// │                                                     │
 // │  file_checksum : u32                                │
 // │    → CRC32 of all bytes from start of file header   │
-// │      to end of bloom_data (exclusive of this field) │
-// │      Detects chunk file corruption on disk.         │
+// │      to end of footer_offset (exclusive of this     │
+// │      field). Detects chunk file corruption on disk. │
 // └─────────────────────────────────────────────────────┘
 // ```
 
@@ -225,11 +236,12 @@ impl ChunkWriter {
             magic: MAGIC,
             version: VERSION,
             _padding: [0u8; 3],
-            chunk_id: chunk_id,
+            chunk_id,
             time_start_ns: global_min_ts,
             time_end_ns: global_max_ts,
             series_count: series_count as u32,
-            total_entries: total_entries,
+            total_entries,
+            col_data_offset: (HEADER_SIZE + dir_size) as u64,
         };
         let header_bytes = header.to_bytes();
 
@@ -241,12 +253,15 @@ impl ChunkWriter {
             buf.extend_from_slice(&build_directory_entry(s, ts_off, val_off));
         }
 
+        let mut col_size = 0usize;
         // column data — interleaved per series: [ts_len][ts_data][val_len][val_data]
         for s in &encoded {
             buf.extend_from_slice(&(s.ts_compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&s.ts_compressed);
+            col_size += 4 + s.ts_compressed.len();
             buf.extend_from_slice(&(s.val_compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&s.val_compressed);
+            col_size += 4 + s.val_compressed.len();
         }
 
         // Footer — bloom filter
@@ -263,6 +278,10 @@ impl ChunkWriter {
         buf.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bloom_bytes);
 
+        // Footer offset
+        let footer_offset = (HEADER_SIZE + dir_size + col_size) as u64;
+        buf.extend_from_slice(&footer_offset.to_le_bytes());
+
         // Footer — CRC32 over everything written so far
         crc.update(&buf);
         let checksum = crc.finalize();
@@ -273,9 +292,9 @@ impl ChunkWriter {
 
         Ok(ChunkWriteResult {
             chunk_id,
-            file_path: file_path,
+            file_path,
             file_size: buf.len() as u64,
-            series_results: series_results,
+            series_results,
         })
     }
 }

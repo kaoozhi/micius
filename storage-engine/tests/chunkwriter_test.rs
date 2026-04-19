@@ -63,7 +63,7 @@ async fn write_and_read_bytes(
 
 /// Parse the 40-byte chunk header from the start of the file.
 /// Returns (magic, version, chunk_id, time_start_ns, time_end_ns, series_count, total_entries).
-fn parse_header(bytes: &[u8]) -> (u32, u8, u64, i64, i64, u32, u32) {
+fn parse_header(bytes: &[u8]) -> (u32, u8, u64, i64, i64, u32, u32, u64) {
     assert!(bytes.len() >= 40, "file too small to contain header");
     let magic = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
     let version = bytes[4];
@@ -73,6 +73,7 @@ fn parse_header(bytes: &[u8]) -> (u32, u8, u64, i64, i64, u32, u32) {
     let time_end_ns = i64::from_le_bytes(bytes[24..32].try_into().unwrap());
     let series_count = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
     let total_entries = u32::from_le_bytes(bytes[36..40].try_into().unwrap());
+    let col_data_offset = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
     (
         magic,
         version,
@@ -81,6 +82,7 @@ fn parse_header(bytes: &[u8]) -> (u32, u8, u64, i64, i64, u32, u32) {
         time_end_ns,
         series_count,
         total_entries,
+        col_data_offset,
     )
 }
 
@@ -103,8 +105,16 @@ async fn test_header_layout() {
     let series = multi_series_data(3, 5);
     let (_, result, bytes) = write_and_read_bytes(series).await;
 
-    let (magic, version, chunk_id, time_start_ns, time_end_ns, series_count, total_entries) =
-        parse_header(&bytes);
+    let (
+        magic,
+        version,
+        chunk_id,
+        time_start_ns,
+        time_end_ns,
+        series_count,
+        total_entries,
+        _col_data_offset,
+    ) = parse_header(&bytes);
 
     assert_eq!(magic, MAGIC);
     assert_eq!(version, VERSION);
@@ -161,7 +171,7 @@ async fn test_multi_series_global_time_bounds() {
     let (_dir, result, bytes) = write_and_read_bytes(data).await;
 
     // Header reflects global bounds across all series
-    let (_, _, _, time_start_ns, time_end_ns, _, _) = parse_header(&bytes);
+    let (_, _, _, time_start_ns, time_end_ns, _, _, _) = parse_header(&bytes);
     assert_eq!(time_start_ns, 50);
     assert_eq!(time_end_ns, 400);
 
@@ -191,7 +201,7 @@ async fn test_series_count_matches_input() {
     data.insert(series_key("disk.io", "node-2"), make_points(3000, 100, 1));
 
     let (_, result, bytes) = write_and_read_bytes(data).await;
-    let (_, _, _, _, _, series_count, total_entries) = parse_header(&bytes);
+    let (_, _, _, _, _, series_count, total_entries, _) = parse_header(&bytes);
 
     assert_eq!(series_count, 3);
     assert_eq!(total_entries, 3 + 7 + 1);
@@ -252,9 +262,17 @@ async fn test_bloom_filter_in_footer() {
     // Reconstruct the bloom filter from those bytes
     // For each written series_key, bloom.check(&key.to_bytes()) returns true
     let series = multi_series_data(5, 10);
-    let (_, _, bytes) = write_and_read_bytes(series).await;
-    let (_magic, _version, _chunk_id, _time_start_ns, _time_end_ns, series_count, _total_entries) =
-        parse_header(&bytes);
+    let (_, result, bytes) = write_and_read_bytes(series).await;
+    let (
+        _magic,
+        _version,
+        _chunk_id,
+        _time_start_ns,
+        _time_end_ns,
+        series_count,
+        _total_entries,
+        _col_data_offset,
+    ) = parse_header(&bytes);
 
     let mut cursor: usize = HEADER_SIZE;
     let mut key_bytes: Vec<Vec<u8>> = Vec::new();
@@ -269,20 +287,23 @@ async fn test_bloom_filter_in_footer() {
         cursor += key_len + DIR_ENTRY_FIXED_SIZE; // offset to next entry
     } // cursor is now at the start of column data
 
-    for _ in 0..series_count {
-        let ts_len = u32::from_le_bytes(
-            (&bytes[cursor..cursor + 4])
-                .try_into()
-                .expect("failed to extract ts len"),
-        ) as usize;
-        cursor += 4 + ts_len;
-        let val_len = u32::from_le_bytes(
-            (&bytes[cursor..cursor + 4])
-                .try_into()
-                .expect("failed to extract val len"),
-        ) as usize;
-        cursor += 4 + val_len;
-    } // cursor is now at the footer
+    // for _ in 0..series_count {
+    //     let ts_len = u32::from_le_bytes(
+    //         (&bytes[cursor..cursor + 4])
+    //             .try_into()
+    //             .expect("failed to extract ts len"),
+    //     ) as usize;
+    //     cursor += 4 + ts_len;
+    //     let val_len = u32::from_le_bytes(
+    //         (&bytes[cursor..cursor + 4])
+    //             .try_into()
+    //             .expect("failed to extract val len"),
+    //     ) as usize;
+    //     cursor += 4 + val_len;
+    // } // cursor is now at the footer
+    let footer_offset = result.file_size as usize - 12;
+    let mut cursor =
+        u64::from_le_bytes(bytes[footer_offset..footer_offset + 8].try_into().unwrap()) as usize;
     let bitmap_bits = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
     cursor += 8;
     let k_num = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
