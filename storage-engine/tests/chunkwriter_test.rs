@@ -1,65 +1,14 @@
+mod common;
+
 use bloomfilter::Bloom;
+use common::*;
 use crc32fast::Hasher as CrcHasher;
 use std::collections::BTreeMap;
 use storage_engine::chunk::format::{
     DIR_ENTRY_FIXED_SIZE, HEADER_SIZE, MAGIC, VERSION, delta_decode, delta_encode,
 };
-use storage_engine::chunk::writer::{ChunkWriteResult, ChunkWriter};
-use storage_engine::types::SeriesKey;
-use tempfile::{TempDir, tempdir};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Build a SeriesKey with a single "host" tag.
-fn series_key(metric: &str, host: &str) -> SeriesKey {
-    SeriesKey {
-        metric_name: metric.to_string(),
-        tags: BTreeMap::from([("host".to_string(), host.to_string())]),
-    }
-}
-
-/// Produce n points starting at ts_start, incrementing by step_ns.
-/// Values are just i as f64.
-fn make_points(ts_start: i64, step_ns: i64, n: usize) -> Vec<(i64, f64)> {
-    (0..n)
-        .map(|i| (ts_start + i as i64 * step_ns, i as f64))
-        .collect()
-}
-
-/// Build a single-series BTreeMap with one series and n points.
-fn single_series_data(metric: &str, host: &str, n: usize) -> BTreeMap<SeriesKey, Vec<(i64, f64)>> {
-    let mut data = BTreeMap::new();
-    data.insert(
-        series_key(metric, host),
-        make_points(1_000_000_000, 1_000_000, n),
-    );
-    data
-}
-
-/// Build a multi-series BTreeMap with m series, each having n points.
-fn multi_series_data(m: usize, n: usize) -> BTreeMap<SeriesKey, Vec<(i64, f64)>> {
-    let mut data = BTreeMap::new();
-    for i in 0..m {
-        data.insert(
-            series_key("cpu.usage", &format!("node-{}", i)),
-            make_points(1_000_000_000 + i as i64 * 1000, 1_000_000, n),
-        );
-    }
-    data
-}
-
-/// Write a chunk and return (dir guard, result, raw file bytes).
-async fn write_and_read_bytes(
-    data: BTreeMap<SeriesKey, Vec<(i64, f64)>>,
-) -> (TempDir, ChunkWriteResult, Vec<u8>) {
-    let dir = tempdir().expect("failed to create temp dir");
-    let writer = ChunkWriter::new(dir.path().to_path_buf());
-    let result = writer.write(data).await.expect("chunk write failed");
-    let bytes = std::fs::read(&result.file_path).expect("failed to read chunk file");
-    (dir, result, bytes)
-}
+use storage_engine::chunk::writer::ChunkWriter;
+use tempfile::tempdir;
 
 /// Parse the 48-byte chunk header from the start of the file.
 /// Returns (magic, version, chunk_id, time_start_ns, time_end_ns, series_count, total_entries).
@@ -286,21 +235,6 @@ async fn test_bloom_filter_in_footer() {
         key_bytes.push(key_byte);
         cursor += key_len + DIR_ENTRY_FIXED_SIZE; // offset to next entry
     } // cursor is now at the start of column data
-
-    // for _ in 0..series_count {
-    //     let ts_len = u32::from_le_bytes(
-    //         (&bytes[cursor..cursor + 4])
-    //             .try_into()
-    //             .expect("failed to extract ts len"),
-    //     ) as usize;
-    //     cursor += 4 + ts_len;
-    //     let val_len = u32::from_le_bytes(
-    //         (&bytes[cursor..cursor + 4])
-    //             .try_into()
-    //             .expect("failed to extract val len"),
-    //     ) as usize;
-    //     cursor += 4 + val_len;
-    // } // cursor is now at the footer
     let footer_offset = result.file_size as usize - 12;
     let mut cursor =
         u64::from_le_bytes(bytes[footer_offset..footer_offset + 8].try_into().unwrap()) as usize;

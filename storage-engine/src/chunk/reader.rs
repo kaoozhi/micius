@@ -44,7 +44,14 @@ impl ChunkReader {
             return Ok(None);
         };
 
-        retrieve_data(&bytes, series_key, ts_offset, val_offset, time_start_ns, time_end_ns)
+        retrieve_data(
+            &bytes,
+            series_key,
+            ts_offset,
+            val_offset,
+            time_start_ns,
+            time_end_ns,
+        )
     }
 }
 

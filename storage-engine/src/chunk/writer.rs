@@ -259,16 +259,17 @@ impl ChunkWriter {
             buf.extend_from_slice(&build_directory_entry(s, ts_off, val_off));
         }
 
-        let mut col_size = 0usize;
         // column data — interleaved per series: [ts_len][ts_data][val_len][val_data]
         for s in &encoded {
             buf.extend_from_slice(&(s.ts_compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&s.ts_compressed);
-            col_size += U32_SIZE + s.ts_compressed.len();
             buf.extend_from_slice(&(s.val_compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&s.val_compressed);
-            col_size += U32_SIZE + s.val_compressed.len();
         }
+
+        // footer_offset points to the start of the bloom data — must be captured
+        // before any bloom bytes are written.
+        let footer_offset = buf.len() as u64;
 
         // Footer — bloom filter
         let bloom_bitmap_bits = bloom.number_of_bits();
@@ -283,9 +284,6 @@ impl ChunkWriter {
         }
         buf.extend_from_slice(&(bloom_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(&bloom_bytes);
-
-        // Footer offset
-        let footer_offset = buf.len() as u64;
         buf.extend_from_slice(&footer_offset.to_le_bytes());
 
         // Footer — CRC32 over everything written so far
