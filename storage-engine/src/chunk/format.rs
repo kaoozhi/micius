@@ -87,7 +87,7 @@ pub const BLOOM_HEADER_SIZE: usize = U64_SIZE + U32_SIZE + BLOOM_SIP_KEYS_SIZE +
 pub fn new_chunk_id() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is before Unix epoch")
         .as_nanos() as u64
 }
 

@@ -97,6 +97,7 @@ use crc32fast::Hasher as CrcHasher;
 use lz4_flex::block::compress_prepend_size;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use tokio::io::AsyncWriteExt;
 
 pub struct ChunkWriter {
     chunk_dir: PathBuf,
@@ -125,8 +126,6 @@ struct EncodedSeries {
     time_end_ns: i64,
     ts_compressed: Vec<u8>,  // lz4-compressed delta-encoded timestamps
     val_compressed: Vec<u8>, // lz4-compressed f64 values
-    min_value: f64,
-    max_value: f64,
     stats: ChunkStats,
 }
 
@@ -138,20 +137,23 @@ fn build_directory_entry(s: &EncodedSeries, ts_offset: u64, val_offset: u64) -> 
     entry.extend_from_slice(&s.entry_count.to_le_bytes());
     entry.extend_from_slice(&ts_offset.to_le_bytes());
     entry.extend_from_slice(&val_offset.to_le_bytes());
-    entry.extend_from_slice(&s.min_value.to_le_bytes());
-    entry.extend_from_slice(&s.max_value.to_le_bytes());
+    entry.extend_from_slice(&s.stats.min_value.to_le_bytes());
+    entry.extend_from_slice(&s.stats.max_value.to_le_bytes());
     entry
 }
 
 impl ChunkWriter {
-    pub fn new(dir: PathBuf) -> Self {
-        ChunkWriter { chunk_dir: dir }
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        ChunkWriter {
+            chunk_dir: dir.into(),
+        }
     }
 
     pub async fn write(
         &self,
         series_data: BTreeMap<SeriesKey, Vec<(i64, f64)>>,
     ) -> Result<ChunkWriteResult> {
+        anyhow::ensure!(!series_data.is_empty(), "cannot write empty chunk");
         let chunk_id = new_chunk_id();
         let file_path = self.chunk_dir.join(format!("chunk-{:016x}.mcs", chunk_id));
         // ── Pass 1: encode and compress all columns ──────────────────
@@ -164,13 +166,18 @@ impl ChunkWriter {
         let mut bloom = Bloom::new_for_fp_rate(series_data.len().max(1), 0.01);
 
         for (key, points) in &series_data {
+            if points.is_empty() {
+                continue;
+            }
             let (timestamps, values): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
             let deltas = delta_encode(&timestamps);
             let stats = ChunkStats::from_values(&values)
                 .ok_or_else(|| anyhow::anyhow!("no chunk stats found"))?;
 
-            global_min_ts = global_min_ts.min(*timestamps.first().unwrap_or(&0));
-            global_max_ts = global_max_ts.max(*timestamps.last().unwrap_or(&0));
+            global_min_ts =
+                global_min_ts.min(*timestamps.first().expect("non-empty: guarded above"));
+            global_max_ts =
+                global_max_ts.max(*timestamps.last().expect("non-empty: guarded above"));
             total_entries += timestamps.len() as u32;
 
             let ts_bytes = i64_slice_to_bytes(&deltas);
@@ -185,12 +192,10 @@ impl ChunkWriter {
                 key: key.clone(),
                 key_bytes,
                 entry_count: timestamps.len() as u32,
-                time_start_ns: *timestamps.first().unwrap(),
-                time_end_ns: *timestamps.last().unwrap(),
+                time_start_ns: *timestamps.first().expect("non-empty: guarded above"),
+                time_end_ns: *timestamps.last().expect("non-empty: guarded above"),
                 ts_compressed,
                 val_compressed,
-                min_value: stats.min_value,
-                max_value: stats.max_value,
                 stats,
             });
         }
@@ -209,9 +214,9 @@ impl ChunkWriter {
 
         for s in &encoded {
             let ts_offset = current_offset as u64;
-            current_offset += 4 + s.ts_compressed.len();
+            current_offset += U32_SIZE + s.ts_compressed.len();
             let val_offset = current_offset as u64;
-            current_offset += 4 + s.val_compressed.len();
+            current_offset += U32_SIZE + s.val_compressed.len();
             offsets.push((ts_offset, val_offset));
             series_results.push(SeriesWriteResult {
                 series_key: s.key.clone(),
@@ -221,7 +226,7 @@ impl ChunkWriter {
                     time_start_ns: s.time_start_ns,
                     time_end_ns: s.time_end_ns,
                     file_path: file_path.clone(),
-                    size_bytes: s.ts_compressed.len() + s.val_compressed.len() + 8,
+                    size_bytes: s.ts_compressed.len() + s.val_compressed.len() + U32_SIZE * 2,
                 },
                 stats: s.stats.clone(),
             });
@@ -259,10 +264,10 @@ impl ChunkWriter {
         for s in &encoded {
             buf.extend_from_slice(&(s.ts_compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&s.ts_compressed);
-            col_size += 4 + s.ts_compressed.len();
+            col_size += U32_SIZE + s.ts_compressed.len();
             buf.extend_from_slice(&(s.val_compressed.len() as u32).to_le_bytes());
             buf.extend_from_slice(&s.val_compressed);
-            col_size += 4 + s.val_compressed.len();
+            col_size += U32_SIZE + s.val_compressed.len();
         }
 
         // Footer — bloom filter
@@ -280,7 +285,7 @@ impl ChunkWriter {
         buf.extend_from_slice(&bloom_bytes);
 
         // Footer offset
-        let footer_offset = (HEADER_SIZE + dir_size + col_size) as u64;
+        let footer_offset = buf.len() as u64;
         buf.extend_from_slice(&footer_offset.to_le_bytes());
 
         // Footer — CRC32 over everything written so far
@@ -289,7 +294,13 @@ impl ChunkWriter {
         buf.extend_from_slice(&checksum.to_le_bytes());
 
         // ── Write to disk ─────────────────────────────────────────────
-        tokio::fs::write(&file_path, &buf).await?;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&file_path)
+            .await?;
+        file.write_all(&buf).await?;
+        file.sync_all().await?;
 
         Ok(ChunkWriteResult {
             chunk_id,
