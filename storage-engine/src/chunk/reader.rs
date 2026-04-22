@@ -8,16 +8,44 @@ use lz4_flex::block::decompress_size_prepended;
 use std::path::Path;
 
 impl ChunkReader {
+    pub async fn check_bloom(path: &Path, series_key: &SeriesKey) -> Result<bool> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = tokio::fs::File::open(path).await?;
+        let file_size = file.metadata().await?.len() as usize;
+        // Read the last FOOTER_TAIL_SIZE(12) bytes: [footer_offset: u64][checksum: u32]
+        file.seek(tokio::io::SeekFrom::Start(
+            (file_size - FOOTER_TAIL_SIZE) as u64,
+        ))
+        .await?;
+        let mut tail = [0u8; FOOTER_TAIL_SIZE];
+        file.read_exact(&mut tail).await?;
+        let footer_offset = u64::from_le_bytes(tail[..FOOTER_OFFSET_SIZE].try_into()?) as usize;
+
+        // Read bloom section from footer_offset to end of bloom data
+        anyhow::ensure!(
+            CHECKSUM_SIZE + footer_offset <= file_size,
+            "bloom footer offset points outside file bounds"
+        );
+        let bloom_section_len = file_size - CHECKSUM_SIZE - footer_offset;
+        file.seek(tokio::io::SeekFrom::Start(footer_offset as u64))
+            .await?;
+        let mut bloom_buf = vec![0u8; bloom_section_len];
+        file.read_exact(&mut bloom_buf).await?;
+
+        let bloom = parse_bloom_from_buf(&bloom_buf)?;
+        Ok(bloom.check(&series_key.to_bytes()))
+    }
     /// Reads all data points for `series_key` within `[time_start_ns, time_end_ns]`
     /// from a single chunk file. Returns `Ok(None)` if the series is absent or has
     /// no points in the requested range — never an error in those cases.
     ///
-    /// Pruning stages (cheapest first):
+    /// The query path calls `check_bloom` first for cheap series-existence rejection
+    /// without loading the full file. `read_series` is only called for bloom-positive
+    /// chunks and performs the remaining pruning stages:
     ///   1. Magic + CRC32 — reject corrupt files before touching any data
-    ///   2. Bloom filter  — skip if series is definitely absent from this chunk
-    ///   3. Header range  — skip if chunk time extent doesn't overlap the query
-    ///   4. Directory scan — locate column offsets for the specific series
-    ///   5. Decompress + filter — return matching points
+    ///   2. Header range  — skip if chunk time extent doesn't overlap the query
+    ///   3. Directory scan — locate column offsets for the specific series
+    ///   4. Decompress + filter — return matching points
     pub async fn read_series(
         path: &Path,
         series_key: &SeriesKey,
@@ -28,10 +56,6 @@ impl ChunkReader {
 
         is_magic_valid(&bytes)?;
         is_checksum_valid(&bytes)?;
-
-        if !check_bloom(&bytes, series_key)? {
-            return Ok(None);
-        }
 
         let header = parse_header(&bytes)?;
         if !is_within_global_range(time_start_ns, time_end_ns, &header) {
@@ -53,12 +77,6 @@ impl ChunkReader {
             time_end_ns,
         )
     }
-}
-
-fn check_bloom(bytes: &[u8], series_key: &SeriesKey) -> Result<bool> {
-    let footer_offset = bytes.len() - FOOTER_TAIL_SIZE;
-    let bloom = parse_bloom(footer_offset, bytes)?;
-    Ok(bloom.check(&series_key.to_bytes()))
 }
 
 fn is_checksum_valid(bytes: &[u8]) -> Result<()> {
@@ -108,45 +126,37 @@ fn parse_header(bytes: &[u8]) -> Result<ChunkHeader> {
     })
 }
 
-fn parse_bloom(footer_offset: usize, bytes: &[u8]) -> Result<Bloom<Vec<u8>>> {
+fn parse_bloom_from_buf(bloom_buf: &[u8]) -> Result<Bloom<Vec<u8>>> {
+    let mut cursor = 0;
     anyhow::ensure!(
-        bytes.len() >= FOOTER_TAIL_SIZE,
-        "file too small to contain footer"
-    );
-    let mut cursor =
-        u64::from_le_bytes(bytes[footer_offset..footer_offset + FOOTER_OFFSET_SIZE].try_into()?)
-            as usize;
-    anyhow::ensure!(
-        cursor + BLOOM_HEADER_SIZE <= bytes.len(),
+        cursor + BLOOM_HEADER_SIZE <= bloom_buf.len(),
         "bloom footer offset 0x{:x} points outside file bounds (file size: {})",
         cursor,
-        bytes.len()
+        bloom_buf.len()
     );
-    let bitmap_bits = u64::from_le_bytes(bytes[cursor..cursor + U64_SIZE].try_into()?);
+    let bitmap_bits = u64::from_le_bytes(bloom_buf[cursor..cursor + U64_SIZE].try_into()?);
     cursor += U64_SIZE;
-    let k_num = u32::from_le_bytes(bytes[cursor..cursor + U32_SIZE].try_into()?);
+    let k_num = u32::from_le_bytes(bloom_buf[cursor..cursor + U32_SIZE].try_into()?);
     cursor += U32_SIZE;
     let sip_keys = [
         (
-            u64::from_le_bytes(bytes[cursor..cursor + U64_SIZE].try_into()?),
-            u64::from_le_bytes(bytes[cursor + U64_SIZE..cursor + 2 * U64_SIZE].try_into()?),
+            u64::from_le_bytes(bloom_buf[cursor..cursor + U64_SIZE].try_into()?),
+            u64::from_le_bytes(bloom_buf[cursor + U64_SIZE..cursor + 2 * U64_SIZE].try_into()?),
         ),
         (
-            u64::from_le_bytes(bytes[cursor + 2 * U64_SIZE..cursor + 3 * U64_SIZE].try_into()?),
-            u64::from_le_bytes(bytes[cursor + 3 * U64_SIZE..cursor + 4 * U64_SIZE].try_into()?),
+            u64::from_le_bytes(bloom_buf[cursor + 2 * U64_SIZE..cursor + 3 * U64_SIZE].try_into()?),
+            u64::from_le_bytes(bloom_buf[cursor + 3 * U64_SIZE..cursor + 4 * U64_SIZE].try_into()?),
         ),
     ];
     cursor += BLOOM_SIP_KEYS_SIZE;
-
-    let bloom_len = u32::from_le_bytes(bytes[cursor..cursor + U32_SIZE].try_into()?) as usize;
+    let bloom_len = u32::from_le_bytes(bloom_buf[cursor..cursor + U32_SIZE].try_into()?) as usize;
     cursor += U32_SIZE;
     anyhow::ensure!(
-        cursor + bloom_len <= bytes.len(),
+        cursor + bloom_len <= bloom_buf.len(),
         "bloom bitmap extends beyond file bounds"
     );
-
     Ok(Bloom::from_existing(
-        &bytes[cursor..cursor + bloom_len],
+        &bloom_buf[cursor..cursor + bloom_len],
         bitmap_bits,
         k_num,
         sip_keys,
@@ -216,16 +226,16 @@ fn retrieve_data(
     let ts_decoded = delta_decode(&ts_deltas);
     let val_decoded = bytes_to_f64_slice(&val_decompressed);
 
-    let points = ts_decoded
-        .iter()
-        .zip(val_decoded.iter())
-        .filter(|(ts, _)| **ts >= time_start_ns && **ts <= time_end_ns)
-        .map(|(&ts, &value)| DataPoint {
+    let points: Vec<DataPoint> = ts_decoded
+        .into_iter()
+        .zip(val_decoded.into_iter())
+        .filter(|(ts, _)| *ts >= time_start_ns && *ts <= time_end_ns)
+        .map(|(ts, value)| DataPoint {
             metric_name: series_key.metric_name.clone(),
             tags: series_key.tags.clone(),
             timestamp_ns: ts,
             value,
         })
-        .collect::<Vec<_>>();
+        .collect();
     Ok(Some(points))
 }

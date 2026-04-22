@@ -196,6 +196,16 @@ async fn test_corrupt_checksum_returns_error() {
 }
 
 #[tokio::test]
+async fn test_check_bloom_present_series_returns_true() {
+    let key = series_key("cpu", "host-0");
+    let (_dir, path) = write_chunk(single_series_data("cpu", "host-0", 10)).await;
+    let result = ChunkReader::check_bloom(&path, &key)
+        .await
+        .expect("check_bloom failed");
+    assert!(result);
+}
+
+#[tokio::test]
 async fn test_bloom_absent_series_returns_none() {
     // Write a chunk containing only "cpu.usage,host=node-0"
     let written_key = series_key("cpu.usage", "node-0");
@@ -210,14 +220,11 @@ async fn test_bloom_absent_series_returns_none() {
 
     let (_dir, path) = write_chunk(data).await;
 
-    let result = ChunkReader::read_series(&path, &absent_key, i64::MIN, i64::MAX)
+    let result = ChunkReader::check_bloom(&path, &absent_key)
         .await
-        .expect("read_series failed");
+        .expect("bloom filter check failed");
 
-    assert!(
-        result.is_none(),
-        "expected None — series absent from bloom filter"
-    );
+    assert!(!result, "expected false — series absent from bloom filter");
 }
 
 #[tokio::test]
