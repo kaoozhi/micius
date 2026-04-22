@@ -1258,7 +1258,7 @@ impl ChunkWriter {
             };
             let meta = ChunkMeta {
                 chunk_id,
-                series_id: 0,   // assigned by ChunkIndex.register()
+                series_id: SeriesId::from(&s.key),
                 time_start_ns: global_min_ts,
                 time_end_ns: global_max_ts,
                 file_path: file_path.clone(),
@@ -1316,33 +1316,53 @@ use crate::types::{DataPoint, SeriesKey};
 pub struct ChunkReader;
 
 impl ChunkReader {
-    pub fn new() -> Self { Self }
-
-    /// Check the bloom filter without reading any column data.
-    /// Returns false if the series is DEFINITELY absent from this chunk.
-    /// Returns true if the series MAY be present (requires full read to confirm).
+    /// Check the bloom filter using a partial file read — only the footer bytes.
+    ///
+    /// Returns false if the series is DEFINITELY absent from this chunk (skip it).
+    /// Returns true if the series MAY be present (proceed to read_series).
+    ///
+    /// This reads only the last 12 bytes to get footer_offset, then reads
+    /// the bloom section starting at that offset. Column data is never loaded,
+    /// so bloom-negative chunks pay minimal I/O cost regardless of file size.
+    ///
+    /// Called from the query path before read_series. read_series re-reads the
+    /// whole file and repeats the bloom check internally — this is intentional:
+    /// check_bloom is the fast pre-filter; read_series is the authoritative path.
     pub async fn check_bloom(
-        &self,
-        chunk_path: &Path,
+        path: &Path,
         series_key: &SeriesKey,
     ) -> Result<bool> {
-        let buf = tokio::fs::read(chunk_path).await?;
-        let bloom = read_bloom_from_footer(&buf)?;
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let mut file = tokio::fs::File::open(path).await?;
+        let file_size = file.metadata().await?.len() as usize;
+
+        // Read the last 12 bytes: [footer_offset: u64][checksum: u32]
+        file.seek(tokio::io::SeekFrom::Start((file_size - FOOTER_TAIL_SIZE) as u64)).await?;
+        let mut tail = [0u8; FOOTER_TAIL_SIZE];
+        file.read_exact(&mut tail).await?;
+        let footer_offset = u64::from_le_bytes(tail[..FOOTER_OFFSET_SIZE].try_into()?) as usize;
+
+        // Read bloom section from footer_offset to end of bloom data
+        let bloom_section_len = file_size - CHECKSUM_SIZE - footer_offset;
+        file.seek(tokio::io::SeekFrom::Start(footer_offset as u64)).await?;
+        let mut bloom_buf = vec![0u8; bloom_section_len];
+        file.read_exact(&mut bloom_buf).await?;
+
+        let bloom = parse_bloom_from_buf(&bloom_buf)?;
         Ok(bloom.check(&series_key.to_bytes()))
     }
 
     /// Read all data points for a specific series within a time range.
     ///
-    /// Returns an empty vec if the series is not present in this chunk
-    /// (bloom false positive). Never returns an error in this case —
-    /// absence is not an error.
+    /// Pruning order (cheapest first): magic → CRC32 → bloom → header range
+    /// → directory scan → decompress + filter.
+    /// Returns Ok(None) if the series is absent or has no points in the range.
     pub async fn read_series(
-        &self,
-        chunk_path: &Path,
+        path: &Path,
         series_key: &SeriesKey,
         time_start_ns: i64,
         time_end_ns: i64,
-    ) -> Result<Vec<DataPoint>> {
+    ) -> Result<Option<Vec<DataPoint>>> {
         let buf = tokio::fs::read(chunk_path).await?;
 
         // Validate magic bytes
@@ -1509,7 +1529,9 @@ pub struct ChunkIndex {
     time_index:      HashMap<SeriesId, BTreeMap<i64, ChunkMeta>>,
     tag_index:       HashMap<(String, String), HashSet<SeriesId>>,
     chunk_stats:     HashMap<ChunkId, ChunkStats>,
-    next_series_id:  SeriesId,
+    /// File sizes keyed by ChunkId — used by the compaction worker to group
+    /// chunks by size without opening any files.
+    file_sizes:      HashMap<ChunkId, u64>,
 }
 
 impl ChunkIndex {
@@ -1519,26 +1541,25 @@ impl ChunkIndex {
             time_index:      HashMap::new(),
             tag_index:       HashMap::new(),
             chunk_stats:     HashMap::new(),
-            next_series_id:  1,
+            file_sizes:      HashMap::new(),
         }
     }
 
     /// Register a new chunk after a successful memtable flush.
-    /// Called once per series per flush.
+    /// Called once per series per flush. `file_size` comes from `ChunkWriteResult`.
     pub fn register(
         &mut self,
         series_key: &SeriesKey,
-        mut meta: ChunkMeta,
+        meta: ChunkMeta,
         stats: ChunkStats,
+        file_size: u64,
     ) -> SeriesId {
-        // Get or create a SeriesId for this key
-        let series_id = if let Some(&id) = self.series_registry.get(series_key) {
-            id
-        } else {
-            let id = self.next_series_id;
-            self.next_series_id += 1;
+        // SeriesId is derived deterministically from the key via xxhash64 —
+        // stable across restarts, no counter state to persist.
+        let series_id = SeriesId::from(series_key);
 
-            self.series_registry.insert(series_key.clone(), id);
+        if !self.series_registry.contains_key(series_key) {
+            self.series_registry.insert(series_key.clone(), series_id);
 
             // Register all tag pairs in the inverted index.
             // This is done once per series — subsequent chunks for the
@@ -1547,13 +1568,9 @@ impl ChunkIndex {
                 self.tag_index
                     .entry((k.clone(), v.clone()))
                     .or_default()
-                    .insert(id);
+                    .insert(series_id);
             }
-
-            id
-        };
-
-        meta.series_id = series_id;
+        }
 
         self.time_index
             .entry(series_id)
@@ -1561,6 +1578,7 @@ impl ChunkIndex {
             .insert(meta.time_start_ns, meta.clone());
 
         self.chunk_stats.insert(meta.chunk_id, stats);
+        self.file_sizes.insert(meta.chunk_id, file_size);
 
         series_id
     }
@@ -1571,6 +1589,7 @@ impl ChunkIndex {
             time_map.remove(&time_start_ns);
         }
         self.chunk_stats.remove(&chunk_id);
+        self.file_sizes.remove(&chunk_id);
     }
 
     /// Resolve which series IDs match the given metric name and tag filters.
@@ -1728,6 +1747,10 @@ use crate::index::chunk_index::ChunkIndex;
 
 /// Snapshot format is JSON for Phase 1 — simple and debuggable.
 /// In a production system this would be a compact binary format.
+///
+/// Note: `tag_index` is NOT persisted. It is rebuilt from `series_registry`
+/// at load time — `SeriesKey.tags` already contains all tag pairs, so no
+/// extra data is required. This keeps the snapshot format minimal.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct IndexSnapshot {
     version: u32,
@@ -1735,6 +1758,7 @@ struct IndexSnapshot {
     series_registry: Vec<(SeriesKey, SeriesId)>,
     chunk_metas: Vec<ChunkMeta>,
     chunk_stats: Vec<(ChunkId, ChunkStats)>,
+    file_sizes: Vec<(ChunkId, u64)>,
 }
 
 pub async fn save_index(
@@ -1946,9 +1970,10 @@ impl CompactionWorker {
     /// Identify groups of same-series chunks that are candidates for merging.
     fn find_merge_candidates(&self, index: &ChunkIndex) -> Vec<MergeGroup> {
         // Implementation: iterate over all series in time_index,
-        // group chunks by size, return groups with >= min_threshold members
+        // use index.file_sizes to group chunks by size without opening files,
+        // return groups with >= min_threshold members.
         // For Phase 1: simplified version — merge all chunks for a series
-        // if there are >= min_threshold of them
+        // if there are >= min_threshold of them.
         vec![]   // placeholder — implement during development
     }
 
