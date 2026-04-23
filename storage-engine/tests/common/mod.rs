@@ -72,6 +72,16 @@ pub async fn write_chunk(
     (dir, path)
 }
 
+/// Write a chunk and return (dir guard, path to the chunk file).
+pub async fn write_chunk_with_results(
+    data: BTreeMap<SeriesKey, Vec<(i64, f64)>>,
+) -> (TempDir, ChunkWriteResult) {
+    let dir = tempdir().expect("failed to create temp dir");
+    let writer = ChunkWriter::new(dir.path());
+    let result = writer.write(data).await.expect("chunk write failed");
+    (dir, result)
+}
+
 /// Overwrite bytes at `range` in the file at `path` with `new_bytes`.
 /// Panics if range length != new_bytes length.
 pub fn corrupt_bytes(path: &Path, range: Range<usize>, new_bytes: &[u8]) {
