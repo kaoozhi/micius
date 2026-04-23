@@ -121,13 +121,19 @@ micius/
 │   │   │   ├── reader.rs              # decompress + decode
 │   │   │   └── format.rs              # binary format constants and helpers
 │   │   ├── index/
-│   │   │   ├── chunk_index.rs         # time-range + stats pruning
-│   │   │   └── tag_index.rs           # inverted index for multi-tag intersection
+│   │   │   ├── chunk_index.rs         # time-range + stats pruning +inverted index for multi-tag intersection
+│   │   │   ├── mod.rs
+│   │   │   └── persistence.rs         # Index Persistence and Startup Recovery
 │   │   ├── compaction/
 │   │   │   └── mod.rs                 # size-tiered background worker
 │   │   └── server/
 │   │       └── mod.rs                 # tonic gRPC server
 │   ├── tests/
+│   │   ├── chunkreader_test.rs        # chunk reader tests
+│   │   ├── chunkwriter_test.rs        # chunk writer tests
+│   │   ├── common
+│   │   │   └── mod.rs                 # helper functions
+│   │   ├── memtable_test.rs           # memtable tests
 │   │   └── wal_test.rs                # WAL integration tests
 │   ├── build.rs                       # prost-build code generation
 │   └── Cargo.toml
@@ -219,13 +225,13 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 - [ ] **Phase 3** — Go query and alert layer
 
 ### Phase 1 progress
-- [ ] WAL writer (append + fsync + segment rotation)
-- [ ] WAL recovery (replay on startup, torn-write detection)
-- [ ] Memtable (BTreeMap, flush threshold)
-- [ ] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
-- [ ] Chunk reader (decompress + decode)
-- [ ] Chunk index (time-range pruning, stats-based predicate pushdown)
-- [ ] Tag inverted index (multi-tag intersection)
+- [x] WAL writer (append + fsync + segment rotation)
+- [x] WAL recovery (replay on startup, torn-write detection)
+- [x] Memtable (BTreeMap, flush threshold)
+- [x] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
+- [x] Chunk reader (decompress + decode)
+- [~] Chunk index (time-range pruning, stats-based predicate pushdown) + Tag inverted index (multi-tag intersection)
+- [ ] Chunk index persistence (load index snapshot on restart, scan chunk not in snapshot, replay WAL)
 - [ ] Compaction worker (size-tiered, background Tokio task)
 - [ ] tonic gRPC server (Append, Query streaming, Compact)
 - [ ] All Phase 1 tests passing
