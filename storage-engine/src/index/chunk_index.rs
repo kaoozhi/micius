@@ -6,7 +6,7 @@ pub struct ChunkIndex {
     series_registry: HashMap<SeriesId, SeriesKey>, // Reverse map between SeriesId and SeriesKey, for O(1) metric-name lookup during query filtering
     time_index: HashMap<SeriesId, BTreeMap<i64, ChunkMeta>>, // a sorted map from chunk start time to chunk metadata per SeriesID
     tag_index: HashMap<(String, String), HashSet<SeriesId>>, // Inverted tag index (tag key, tag value) map with SeriesID
-    chunk_stats: HashMap<ChunkId, ChunkStats>,               // Chunk stats map per ChunkID
+    chunk_stats: HashMap<(ChunkId, SeriesId), ChunkStats>,   // Chunk stats map per ChunkID
     /// File sizes keyed by ChunkId — used by the compaction worker to group
     /// chunks by size without opening any files.
     file_sizes: HashMap<ChunkId, u64>, // Chunk size map per ChunkID
@@ -51,7 +51,7 @@ impl ChunkIndex {
             .or_default()
             .insert(time_start_ns, meta);
 
-        self.chunk_stats.insert(chunk_id, stats);
+        self.chunk_stats.insert((chunk_id, series_id), stats);
         self.file_sizes.insert(chunk_id, file_size);
         series_id
     }
@@ -62,7 +62,7 @@ impl ChunkIndex {
             time_map.remove(&time_start_ns);
         }
 
-        self.chunk_stats.remove(&chunk_id);
+        self.chunk_stats.remove(&(chunk_id, series_id));
         self.file_sizes.remove(&chunk_id);
     }
 
@@ -148,7 +148,7 @@ impl ChunkIndex {
             .filter(|(_, meta)| time_start_ns <= meta.time_end_ns)
             .filter(|(_, meta)| {
                 predicate.is_none_or(|p| {
-                    let Some(stats) = self.chunk_stats.get(&meta.chunk_id) else {
+                    let Some(stats) = self.chunk_stats.get(&(meta.chunk_id, meta.series_id)) else {
                         return true; // no stats — must read
                     };
                     p.matches(stats.min_value, stats.max_value)
@@ -156,6 +156,14 @@ impl ChunkIndex {
             })
             .map(|(_, meta)| meta.clone())
             .collect()
+    }
+
+    pub fn series_count(&self) -> usize {
+        self.series_registry.len()
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_stats.len()
     }
 }
 
