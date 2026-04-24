@@ -63,7 +63,10 @@ impl ChunkIndex {
         }
 
         self.chunk_stats.remove(&(chunk_id, series_id));
-        self.file_sizes.remove(&chunk_id);
+        let chunk_still_referenced = self.chunk_stats.keys().any(|(cid, _)| *cid == chunk_id);
+        if !chunk_still_referenced {
+            self.file_sizes.remove(&chunk_id);
+        }
     }
 
     /// Resolve which series IDs match the given metric name and tag filters.
@@ -162,8 +165,14 @@ impl ChunkIndex {
         self.series_registry.len()
     }
 
-    pub fn chunk_count(&self) -> usize {
+    /// Number of (series, chunk) pairs tracked — one per series per flush.
+    pub fn series_chunk_count(&self) -> usize {
         self.chunk_stats.len()
+    }
+
+    /// Number of distinct chunk files — used by compaction for size grouping.
+    pub fn chunk_file_count(&self) -> usize {
+        self.file_sizes.len()
     }
 }
 

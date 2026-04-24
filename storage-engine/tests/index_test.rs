@@ -166,7 +166,7 @@ async fn test_time_range_pruning() {
         dirs.push(dir);
     }
     assert_eq!(index.series_count(), 1);
-    assert_eq!(index.chunk_count(), 5);
+    assert_eq!(index.chunk_file_count(), 5);
 
     let series_id = SeriesId::from(&key);
     // Query [15s, 35s] — overlaps chunks 1, 2, 3 only.
@@ -319,9 +319,9 @@ async fn test_register_deregister() {
 
     // After deregister: chunk is gone
     assert_eq!(
-        index.chunk_count(),
+        index.chunk_file_count(),
         0,
-        "chunk_count should drop after deregister"
+        "file_sizes entry should be gone after deregister"
     );
 
     let after = index.prune_chunks(&series_id, i64::MIN, i64::MAX, None);
