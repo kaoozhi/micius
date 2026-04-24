@@ -11,9 +11,10 @@ pub struct WalWriter {
     file: File,
     current_seq: Sequence,
     current_size: u64,
-    current_segment: u32,
+    current_segment: u64,
     wal_dir: PathBuf,
     max_segment_bytes: u64,
+    completed_segments: Vec<(u64, Sequence)>,
 }
 
 impl WalWriter {
@@ -26,6 +27,12 @@ impl WalWriter {
         // Resume the most recent segment, or start fresh at segment 1.
         let segment_number = highest_segment_number(wal_dir).await?.unwrap_or(1);
         let path = segment_path(wal_dir, segment_number);
+
+        // After a crash-restart, pre-existing segments should be re-populated
+        let mut completed_segments = Vec::new();
+        for n in 1..segment_number {
+            completed_segments.push((n, u64::MAX)); // all entries in prior segments are safe to delete
+        }
 
         // Append mode — never truncate an existing segment on open.
         let file = OpenOptions::new()
@@ -45,6 +52,7 @@ impl WalWriter {
             current_segment: segment_number,
             wal_dir: wal_dir.to_path_buf(),
             max_segment_bytes,
+            completed_segments,
         })
     }
 
@@ -96,6 +104,8 @@ impl WalWriter {
     }
 
     async fn rotate(&mut self) -> Result<()> {
+        self.completed_segments
+            .push((self.current_segment, self.current_seq));
         self.current_segment += 1;
         let path = self.current_segment_path();
         self.file = OpenOptions::new()
@@ -108,9 +118,10 @@ impl WalWriter {
         Ok(())
     }
 
-    /// Returns the current WAL sequence number.
-    /// Used by the replication layer to track what has been shipped
-    /// to follower nodes.
+    /// Returns the last sequence number written to the WAL.
+    /// Called by the flush handler before draining the memtable to capture
+    /// the sequence boundary — segments completed up to this point are safe
+    /// to delete after the flush succeeds.
     pub fn current_sequence(&self) -> Sequence {
         self.current_seq
     }
@@ -119,20 +130,33 @@ impl WalWriter {
     pub fn current_segment_path(&self) -> PathBuf {
         segment_path(&self.wal_dir, self.current_segment)
     }
+
+    pub fn drain_completed_before(&mut self, flushed_seq: Sequence) -> Vec<PathBuf> {
+        let mut to_delete = Vec::new();
+        self.completed_segments.retain(|(seg, max_seq)| {
+            if *max_seq <= flushed_seq {
+                to_delete.push(segment_path(&self.wal_dir, *seg));
+                false
+            } else {
+                true
+            }
+        });
+        to_delete
+    }
 }
 
-fn segment_path(wal_dir: &Path, segment: u32) -> PathBuf {
+fn segment_path(wal_dir: &Path, segment: u64) -> PathBuf {
     wal_dir.join(format!("{:020}.wal", segment))
 }
 
-async fn highest_segment_number(wal_dir: &Path) -> Result<Option<u32>> {
-    let mut max: Option<u32> = None;
+async fn highest_segment_number(wal_dir: &Path) -> Result<Option<u64>> {
+    let mut max: Option<u64> = None;
     let mut dir = tokio::fs::read_dir(wal_dir).await?;
     while let Some(entry) = dir.next_entry().await? {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.ends_with(".wal") {
-            if let Ok(n) = name.trim_end_matches(".wal").parse::<u32>() {
+            if let Ok(n) = name.trim_end_matches(".wal").parse::<u64>() {
                 match max {
                     None => max = Some(n),
                     Some(m) if n > m => max = Some(n),

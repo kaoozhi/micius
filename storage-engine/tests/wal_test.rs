@@ -89,6 +89,118 @@ async fn test_segment_rotation() {
 }
 
 // ---------------------------------------------------------------------------
+// WAL clearing tests
+// ---------------------------------------------------------------------------
+
+fn count_wal_files(dir: &std::path::Path) -> usize {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "wal"))
+        .count()
+}
+
+#[tokio::test]
+async fn test_resume_seq_continuous_across_restart() {
+    let test_dir = tempdir().expect("failed to create temp dir");
+
+    // Session 1: write 3 batches — sequences 1, 2, 3
+    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, 0)
+        .await
+        .expect("failed to open WAL");
+    for _ in 0..3 {
+        wal.append(&sample_points(1)).await.expect("failed to append");
+    }
+    assert_eq!(wal.current_sequence(), 3);
+    drop(wal);
+
+    // Simulate restart: recover to find last_sequence
+    let recovered = recover(test_dir.path()).await.expect("failed to recover");
+    assert_eq!(recovered.last_sequence, 3);
+
+    // Session 2: open with resume_seq from recovery
+    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, recovered.last_sequence)
+        .await
+        .expect("failed to reopen WAL");
+
+    // First append after restart must produce 4, not 1
+    let seq = wal.append(&sample_points(1)).await.expect("failed to append");
+    assert_eq!(seq, 4, "sequence must continue from last_sequence + 1 across restarts");
+}
+
+#[tokio::test]
+async fn test_drain_completed_before_no_rotation() {
+    // Single segment, no rotation → drain always returns empty
+    let test_dir = tempdir().expect("failed to create temp dir");
+    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, 0)
+        .await
+        .expect("failed to open WAL");
+    wal.append(&sample_points(1)).await.expect("failed to append");
+
+    assert!(wal.drain_completed_before(0).is_empty(),       "no completed segments → empty even at seq 0");
+    assert!(wal.drain_completed_before(u64::MAX).is_empty(), "no completed segments → empty even at u64::MAX");
+}
+
+#[tokio::test]
+async fn test_drain_completed_before_basic() {
+    let test_dir = tempdir().expect("failed to create temp dir");
+    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES, 0)
+        .await
+        .expect("failed to open WAL");
+
+    // Write until 2 rotations have occurred (3 segment files on disk)
+    let mut last_seq = 0u64;
+    loop {
+        last_seq = wal.append(&sample_points(5)).await.expect("failed to append");
+        if count_wal_files(test_dir.path()) >= 3 {
+            break;
+        }
+    }
+
+    // All completed segments should be returned
+    let paths = wal.drain_completed_before(u64::MAX);
+    assert_eq!(paths.len(), 2, "expected 2 completed segments after 2 rotations");
+    for path in &paths {
+        assert!(path.exists(), "returned path must exist on disk: {:?}", path);
+    }
+
+    // Second call is idempotent — list was drained
+    assert!(wal.drain_completed_before(u64::MAX).is_empty(), "drain must be idempotent");
+}
+
+#[tokio::test]
+async fn test_drain_completed_before_boundary() {
+    // Tests the <= boundary: a segment with max_seq N is returned when
+    // flushed_seq == N but not when flushed_seq == N - 1.
+    let test_dir = tempdir().expect("failed to create temp dir");
+    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES, 0)
+        .await
+        .expect("failed to open WAL");
+
+    // Write batches until exactly one rotation — detect by file count change.
+    // The append that triggers rotation returns the max_seq of the closed segment.
+    let mut rotation_seq: Option<u64> = None;
+    loop {
+        let before = count_wal_files(test_dir.path());
+        let seq = wal.append(&sample_points(5)).await.expect("failed to append");
+        let after = count_wal_files(test_dir.path());
+        if after > before {
+            rotation_seq = Some(seq); // this seq is the max_seq of the completed segment
+            break;
+        }
+    }
+    let max_seq = rotation_seq.expect("rotation must have occurred");
+
+    // One below the boundary — segment must NOT be returned
+    let below = wal.drain_completed_before(max_seq - 1);
+    assert!(below.is_empty(), "segment with max_seq={max_seq} must not be returned at flushed_seq={}", max_seq - 1);
+
+    // Exactly at the boundary — segment MUST be returned
+    let at = wal.drain_completed_before(max_seq);
+    assert_eq!(at.len(), 1, "segment with max_seq={max_seq} must be returned at flushed_seq={max_seq}");
+}
+
+// ---------------------------------------------------------------------------
 // Recovery tests (need recovery.rs)
 // ---------------------------------------------------------------------------
 
