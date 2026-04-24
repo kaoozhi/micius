@@ -82,7 +82,7 @@ impl ChunkIndex {
             return self
                 .series_registry
                 .iter()
-                .filter(|(_, s_k)| s_k.metric_name == metric)
+                .filter(|(_, sk)| sk.metric_name == metric)
                 .map(|(&id, _)| id)
                 .collect();
         }
@@ -94,7 +94,20 @@ impl ChunkIndex {
         let Some(first_set) = self.tag_index.get(&(first_key.clone(), first_val.clone())) else {
             return vec![];
         };
-        let mut candidate_ids: HashSet<SeriesId> = first_set.clone();
+
+        let mut candidate_ids: HashSet<SeriesId> = first_set
+            .iter()
+            .copied()
+            .filter(|id| {
+                self.series_registry
+                    .get(id)
+                    .map_or(false, |sk| sk.metric_name == metric)
+            })
+            .collect();
+
+        if candidate_ids.is_empty() {
+            return vec![];
+        }
 
         loop {
             let Some((tag_key, tag_val)) = filters_iter.next() else {
@@ -113,10 +126,10 @@ impl ChunkIndex {
         candidate_ids
             .into_iter()
             .filter(|id| {
-                let Some(s_key) = self.series_registry.get(id) else {
+                let Some(sk) = self.series_registry.get(id) else {
                     return false;
                 };
-                s_key.metric_name == metric
+                sk.metric_name == metric
             })
             .collect()
     }
