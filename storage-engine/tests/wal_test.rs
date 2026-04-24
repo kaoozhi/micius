@@ -42,7 +42,7 @@ const MAX_SEGMENT_BYTES: u64 = 256;
 #[tokio::test]
 async fn test_append_returns_incrementing_sequence() {
     let test_dir = tempdir().expect("failed to create temp dir");
-    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES)
+    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES, 0)
         .await
         .expect("failed to open WAL");
 
@@ -61,7 +61,7 @@ async fn test_segment_rotation() {
     let mut batch: u8 = 0;
 
     let test_dir = tempdir().expect("failed to create temp dir");
-    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES)
+    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES, 0)
         .await
         .expect("failed to open WAL");
     loop {
@@ -96,7 +96,7 @@ async fn test_segment_rotation() {
 async fn test_append_and_recover() {
     // Single segment — large max to prevent rotation
     let test_dir = tempdir().expect("failed to create temp dir");
-    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024)
+    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, 0)
         .await
         .expect("failed to open WAL");
     let batch_1 = sample_points(1);
@@ -115,7 +115,7 @@ async fn test_append_and_recover() {
 async fn test_torn_write_stops_recovery() {
     // Write 2 batches, truncate last entry mid-payload, recover — only first batch returned
     let test_dir = tempdir().expect("failed to create temp dir");
-    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024)
+    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, 0)
         .await
         .expect("failed to open WAL");
     let batch_1 = sample_points(3);
@@ -154,7 +154,7 @@ async fn test_torn_write_stops_recovery() {
 async fn test_checksum_mismatch_stops_recovery() {
     // write 2 batches, flip a bit in second payload, recover — only first batch returned
     let test_dir = tempdir().expect("failed to create temp dir");
-    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024)
+    let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, 0)
         .await
         .expect("failed to open WAL");
     println!("batch size {}", get_wal_entry_size(&sample_points(3), 0));
@@ -193,7 +193,7 @@ async fn test_checksum_mismatch_stops_recovery() {
 async fn test_recovery_across_segments() {
     // Small max_segment_bytes forces rotation across multiple segments
     let test_dir = tempdir().expect("failed to create temp dir");
-    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES)
+    let mut wal = WalWriter::open(test_dir.path(), MAX_SEGMENT_BYTES, 0)
         .await
         .expect("failed to open WAL");
     let batch_1 = sample_points(100);

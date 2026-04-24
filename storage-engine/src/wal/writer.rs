@@ -17,10 +17,10 @@ pub struct WalWriter {
 }
 
 impl WalWriter {
-    /// Opens the WAL for appending. Resumes the most recent segment if one
-    /// exists, otherwise creates segment 1. Called once at startup, before
-    /// WAL recovery replays entries into the memtable.
-    pub async fn open(wal_dir: &Path, max_segment_bytes: u64) -> Result<Self> {
+    /// Opens the WAL for appending. Must be called after WAL recovery so that
+    /// `resume_seq` can be set to `RecoveryResult.last_sequence`, ensuring
+    /// sequence numbers are continuous across restarts.
+    pub async fn open(wal_dir: &Path, max_segment_bytes: u64, resume_seq: u64) -> Result<Self> {
         tokio::fs::create_dir_all(wal_dir).await?;
 
         // Resume the most recent segment, or start fresh at segment 1.
@@ -40,7 +40,7 @@ impl WalWriter {
 
         Ok(Self {
             file,
-            current_seq: 0,
+            current_seq: resume_seq,
             current_size,
             current_segment: segment_number,
             wal_dir: wal_dir.to_path_buf(),
