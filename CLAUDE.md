@@ -230,8 +230,8 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 - [x] Memtable (BTreeMap, flush threshold)
 - [x] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
 - [x] Chunk reader (decompress + decode)
-- [~] Chunk index (time-range pruning, stats-based predicate pushdown) + Tag inverted index (multi-tag intersection)
-- [ ] Chunk index persistence (load index snapshot on restart, scan chunk not in snapshot, replay WAL)
+- [x] Chunk index (time-range pruning, stats-based predicate pushdown) + Tag inverted index (multi-tag intersection)
+- [x] Chunk index persistence (load index snapshot on restart, scan chunk not in snapshot, replay WAL)
 - [ ] Compaction worker (size-tiered, background Tokio task)
 - [ ] tonic gRPC server (Append, Query streaming, Compact)
 - [ ] All Phase 1 tests passing

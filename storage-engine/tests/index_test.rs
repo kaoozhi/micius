@@ -4,7 +4,9 @@ mod common;
 use common::*;
 use std::collections::{BTreeMap, HashMap};
 use storage_engine::index::chunk_index::{ChunkIndex, ValuePredicate};
+use storage_engine::index::persistence::{load_index, save_index};
 use storage_engine::types::*;
+use tempfile::tempdir;
 
 #[tokio::test]
 async fn test_single_tag_resolution() {
@@ -326,4 +328,100 @@ async fn test_register_deregister() {
 
     let after = index.prune_chunks(&series_id, i64::MIN, i64::MAX, None);
     assert!(after.is_empty(), "chunk should be gone after deregister");
+}
+
+#[tokio::test]
+async fn test_persistence_roundtrip_single_series() {
+    // Write 3 chunks for one series, save snapshot, reload, verify counts and queries match.
+    let key = series_key("cpu", "web1");
+    let step_ns: i64 = 1_000_000_000;
+    let wal_sequence: u64 = 42;
+
+    let mut index = ChunkIndex::new();
+    let mut dirs = Vec::new();
+    let mut time_start = 0i64;
+    for _ in 0..3 {
+        let mut data = BTreeMap::new();
+        data.insert(key.clone(), make_points(time_start, step_ns, 10));
+        time_start += step_ns * 10;
+        let (dir, write_result) = write_chunk_with_results(data).await;
+        for s in &write_result.series_results {
+            index.register(&s.series_key, s.meta.clone(), s.stats.clone(), write_result.file_size);
+        }
+        dirs.push(dir);
+    }
+
+    let snap_dir = tempdir().unwrap();
+    let snap_path = snap_dir.path().join("index.bin");
+    save_index(&index, &snap_path, wal_sequence).await.expect("save failed");
+
+    let (loaded, loaded_seq) = load_index(&snap_path)
+        .await
+        .expect("load failed")
+        .expect("snapshot should exist");
+
+    assert_eq!(loaded_seq, wal_sequence, "WAL sequence must roundtrip");
+    assert_eq!(loaded.series_count(), 1);
+    assert_eq!(loaded.chunk_file_count(), 3);
+
+    // tag_index rebuilt — resolve_series must work
+    let series_id = SeriesId::from(&key);
+    let resolved = loaded.resolve_series(
+        "cpu",
+        &HashMap::from([("host".to_string(), "web1".to_string())]),
+    );
+    assert_eq!(resolved.len(), 1);
+    assert!(resolved.contains(&series_id));
+
+    // time_index rebuilt — all 3 chunks visible
+    let chunks = loaded.prune_chunks(&series_id, i64::MIN, i64::MAX, None);
+    assert_eq!(chunks.len(), 3, "all 3 chunks must survive roundtrip");
+}
+
+#[tokio::test]
+async fn test_persistence_roundtrip_multi_series() {
+    // 3 series (2 cpu, 1 mem) in one chunk file — verify metric separation after reload.
+    let key_cpu1 = series_key("cpu", "web1");
+    let key_cpu2 = series_key("cpu", "web2");
+    let key_mem  = series_key("mem", "db1");
+
+    let mut data = BTreeMap::new();
+    data.insert(key_cpu1.clone(), make_points(0, 1_000_000_000, 10));
+    data.insert(key_cpu2.clone(), make_points(0, 1_000_000_000, 10));
+    data.insert(key_mem.clone(),  make_points(0, 1_000_000_000, 10));
+
+    let (_dir, write_result) = write_chunk_with_results(data).await;
+    let mut index = ChunkIndex::new();
+    for s in &write_result.series_results {
+        index.register(&s.series_key, s.meta.clone(), s.stats.clone(), write_result.file_size);
+    }
+
+    let snap_dir = tempdir().unwrap();
+    let snap_path = snap_dir.path().join("index.bin");
+    save_index(&index, &snap_path, 0).await.expect("save failed");
+
+    let (loaded, _) = load_index(&snap_path)
+        .await
+        .expect("load failed")
+        .expect("snapshot should exist");
+
+    assert_eq!(loaded.series_count(), 3);
+
+    // Metric isolation: cpu returns 2, mem returns 1
+    let cpu = loaded.resolve_series("cpu", &HashMap::new());
+    assert_eq!(cpu.len(), 2, "two cpu series after reload");
+    assert!(cpu.contains(&SeriesId::from(&key_cpu1)));
+    assert!(cpu.contains(&SeriesId::from(&key_cpu2)));
+
+    let mem = loaded.resolve_series("mem", &HashMap::new());
+    assert_eq!(mem.len(), 1, "one mem series after reload");
+    assert!(mem.contains(&SeriesId::from(&key_mem)));
+}
+
+#[tokio::test]
+async fn test_persistence_missing_file_returns_none() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("nonexistent.bin");
+    let result = load_index(&path).await.expect("should not error on missing file");
+    assert!(result.is_none());
 }

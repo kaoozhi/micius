@@ -3,13 +3,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Default)]
 pub struct ChunkIndex {
-    series_registry: HashMap<SeriesId, SeriesKey>, // Reverse map between SeriesId and SeriesKey, for O(1) metric-name lookup during query filtering
-    time_index: HashMap<SeriesId, BTreeMap<i64, ChunkMeta>>, // a sorted map from chunk start time to chunk metadata per SeriesID
-    tag_index: HashMap<(String, String), HashSet<SeriesId>>, // Inverted tag index (tag key, tag value) map with SeriesID
-    chunk_stats: HashMap<(ChunkId, SeriesId), ChunkStats>,   // Chunk stats map per ChunkID
+    pub series_registry: HashMap<SeriesId, SeriesKey>, // Reverse map between SeriesId and SeriesKey, for O(1) metric-name lookup during query filtering
+    pub time_index: HashMap<SeriesId, BTreeMap<i64, ChunkMeta>>, // a sorted map from chunk start time to chunk metadata per SeriesID
+    pub tag_index: HashMap<(String, String), HashSet<SeriesId>>, // Inverted tag index (tag key, tag value) map with SeriesID
+    pub chunk_stats: HashMap<(ChunkId, SeriesId), ChunkStats>,   // Chunk stats map per ChunkID
     /// File sizes keyed by ChunkId — used by the compaction worker to group
     /// chunks by size without opening any files.
-    file_sizes: HashMap<ChunkId, u64>, // Chunk size map per ChunkID
+    pub file_sizes: HashMap<ChunkId, u64>, // Chunk size map per ChunkID
 }
 
 impl ChunkIndex {
