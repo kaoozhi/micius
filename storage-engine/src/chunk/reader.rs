@@ -68,14 +68,53 @@ impl ChunkReader {
             return Ok(None);
         };
 
-        retrieve_data(
+        let data = retrieve_data(
             &bytes,
             series_key,
             ts_offset,
             val_offset,
-            time_start_ns,
-            time_end_ns,
-        )
+            Some(time_start_ns),
+            Some(time_end_ns),
+        )?;
+        Ok(Some(data))
+    }
+
+    pub async fn read_chunk(path: &Path) -> Result<Vec<DataPoint>> {
+        let bytes = tokio::fs::read(path).await?;
+
+        is_magic_valid(&bytes)?;
+        is_checksum_valid(&bytes)?;
+
+        let header = parse_header(&bytes)?;
+        let mut data: Vec<DataPoint> = Vec::with_capacity(header.total_entries as usize);
+        let mut cursor = HEADER_SIZE;
+
+        for _ in 0..header.series_count {
+            let key_len = u32::from_le_bytes(bytes[cursor..cursor + U32_SIZE].try_into()?) as usize;
+            let key_bytes = &bytes[cursor + U32_SIZE..cursor + U32_SIZE + key_len];
+            let series_key = SeriesKey::from_bytes(key_bytes)?;
+            // Entry layout: [key_len: u32][key_bytes][entry_count: u32][ts_offset: u64][val_offset: u64]...
+            let ts_cursor = cursor + U32_SIZE + key_len + U32_SIZE;
+            let ts_col_offset =
+                u64::from_le_bytes(bytes[ts_cursor..ts_cursor + U64_SIZE].try_into()?);
+            let val_cursor = ts_cursor + U64_SIZE;
+            let val_col_offset =
+                u64::from_le_bytes(bytes[val_cursor..val_cursor + U64_SIZE].try_into()?);
+            let series = retrieve_data(
+                &bytes,
+                &series_key,
+                ts_col_offset as usize,
+                val_col_offset as usize,
+                None,
+                None,
+            )?;
+            data.extend(series);
+
+            // DIR_ENTRY_FIXED_SIZE includes the key_len u32 field itself plus all other fixed fields.
+            cursor += key_len + DIR_ENTRY_FIXED_SIZE;
+        }
+
+        Ok(data)
     }
 }
 
@@ -203,9 +242,9 @@ fn retrieve_data(
     series_key: &SeriesKey,
     ts_offset: usize,
     val_offset: usize,
-    time_start_ns: i64,
-    time_end_ns: i64,
-) -> Result<Option<Vec<DataPoint>>> {
+    time_start_ns: Option<i64>,
+    time_end_ns: Option<i64>,
+) -> Result<Vec<DataPoint>> {
     let ts_len =
         u32::from_le_bytes(bytes[ts_offset..ts_offset + COL_LEN_SIZE].try_into()?) as usize;
     let ts_decompressed = decompress_size_prepended(
@@ -229,7 +268,9 @@ fn retrieve_data(
     let points: Vec<DataPoint> = ts_decoded
         .into_iter()
         .zip(val_decoded.into_iter())
-        .filter(|(ts, _)| *ts >= time_start_ns && *ts <= time_end_ns)
+        .filter(|(ts, _)| {
+            *ts >= time_start_ns.unwrap_or(i64::MIN) && *ts <= time_end_ns.unwrap_or(i64::MAX)
+        })
         .map(|(ts, value)| DataPoint {
             metric_name: series_key.metric_name.clone(),
             tags: series_key.tags.clone(),
@@ -237,5 +278,9 @@ fn retrieve_data(
             value,
         })
         .collect();
-    Ok(Some(points))
+    Ok(points)
 }
+
+// fn reconstruct_entries() -> Result<Option<BTreeMap<SeriesKey, Vec<(i64, f64)>>>> {
+//     Ok(())
+// }

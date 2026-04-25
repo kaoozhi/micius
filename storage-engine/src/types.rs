@@ -36,6 +36,24 @@ impl SeriesKey {
         }
         s.into_bytes()
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let s = std::str::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("invalid UTF-8 in series key: {e}"))?;
+        let mut parts = s.split(',');
+        let metric_name = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty series key bytes"))?
+            .to_string();
+        let mut tags = BTreeMap::new();
+        for kv in parts {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("malformed tag pair: {kv:?}"))?;
+            tags.insert(k.to_string(), v.to_string());
+        }
+        Ok(Self { metric_name, tags })
+    }
 }
 
 impl From<&SeriesKey> for SeriesId {
@@ -65,9 +83,9 @@ pub type Sequence = u64;
 pub struct SeriesChunkEntry {
     pub chunk_id: ChunkId,
     pub series_id: SeriesId,
-    pub time_start_ns: i64,  // this series' earliest timestamp in this chunk
-    pub time_end_ns: i64,    // this series' latest timestamp in this chunk
-    pub size_bytes: usize,   // byte footprint of this series' columns in the file
+    pub time_start_ns: i64, // this series' earliest timestamp in this chunk
+    pub time_end_ns: i64,   // this series' latest timestamp in this chunk
+    pub size_bytes: usize,  // byte footprint of this series' columns in the file
 }
 
 /// Value statistics for one series within one chunk — used for predicate pushdown.
