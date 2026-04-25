@@ -107,8 +107,7 @@ pub struct ChunkWriter {
 /// Result of writing a chunk — one entry per series
 pub struct ChunkWriteResult {
     pub chunk_id: ChunkId,
-    pub file_path: PathBuf,
-    pub file_size: u64,
+    pub chunk_meta: ChunkMeta,
     /// Per-series metadata for registering in the ChunkIndex
     pub series_results: Vec<SeriesWriteResult>,
 }
@@ -302,8 +301,10 @@ impl ChunkWriter {
 
         Ok(ChunkWriteResult {
             chunk_id,
-            file_path,
-            file_size: buf.len() as u64,
+            chunk_meta: ChunkMeta {
+                file_path,
+                file_size: buf.len() as u64,
+            },
             series_results,
         })
     }

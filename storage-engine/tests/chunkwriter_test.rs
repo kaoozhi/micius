@@ -45,8 +45,11 @@ async fn test_write_produces_file() {
     let dir = tempdir().expect("failed to create temp dir");
     let writer = ChunkWriter::new(dir.path().to_path_buf());
     let result = writer.write(serie).await.expect("chunk write failed");
-    assert!(result.file_path.exists(), "chunk file does not exist");
-    assert!(result.file_size > HEADER_SIZE as u64);
+    assert!(
+        result.chunk_meta.file_path.exists(),
+        "chunk file does not exist"
+    );
+    assert!(result.chunk_meta.file_size > HEADER_SIZE as u64);
 }
 
 #[tokio::test]
@@ -167,9 +170,9 @@ async fn test_chunk_id_unique_across_writes() {
     let result_2 = writer.write(serie_2).await.expect("chunk write failed");
 
     assert_ne!(result_1.chunk_id, result_2.chunk_id);
-    assert!(result_1.file_path.exists());
-    assert!(result_2.file_path.exists());
-    assert_ne!(result_1.file_path, result_2.file_path);
+    assert!(result_1.chunk_meta.file_path.exists());
+    assert!(result_2.chunk_meta.file_path.exists());
+    assert_ne!(result_1.chunk_meta.file_path, result_2.chunk_meta.file_path);
 }
 
 #[tokio::test]
@@ -188,14 +191,14 @@ async fn test_file_ends_with_crc_checksum() {
 
     // Read the last 4 bytes of the file to get the stored checksum
     let stored_checksum = u32::from_le_bytes(
-        (&bytes[result.file_size as usize - 4..])
+        (&bytes[result.chunk_meta.file_size as usize - 4..])
             .try_into()
             .expect("Slice must be a 4 bytes long"),
     );
 
     // Recompute the checksum over everything before the last 4 bytes
     let mut crc = CrcHasher::new();
-    crc.update(&bytes[..result.file_size as usize - 4]);
+    crc.update(&bytes[..result.chunk_meta.file_size as usize - 4]);
     let computed_checksum = crc.finalize();
 
     assert_eq!(
@@ -235,7 +238,7 @@ async fn test_bloom_filter_in_footer() {
         key_bytes.push(key_byte);
         cursor += key_len + DIR_ENTRY_FIXED_SIZE; // offset to next entry
     } // cursor is now at the start of column data
-    let footer_offset = result.file_size as usize - 12;
+    let footer_offset = result.chunk_meta.file_size as usize - 12;
     let mut cursor =
         u64::from_le_bytes(bytes[footer_offset..footer_offset + 8].try_into().unwrap()) as usize;
     let bitmap_bits = u64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());

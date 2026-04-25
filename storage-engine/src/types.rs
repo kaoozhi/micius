@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// A single measurement at a point in time
 #[derive(Debug, Clone, PartialEq)]
@@ -56,21 +57,22 @@ pub type ChunkId = u64;
 /// WAL sequence number — monotonically increasing per batch.
 pub type Sequence = u64;
 
-/// Metadata about a chunk file stored in the ChunkIndex.
-/// Does not contain the chunk data itself — only enough information
-/// to locate and evaluate the chunk during query planning.
+/// Records a single series' presence within a specific chunk file.
+/// Stored in `ChunkIndex.time_index` keyed by (SeriesId, time_start_ns).
+/// Series-level: each series in a multi-series chunk has its own entry
+/// with its own time range and column footprint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeriesChunkEntry {
     pub chunk_id: ChunkId,
     pub series_id: SeriesId,
-    pub time_start_ns: i64,
-    pub time_end_ns: i64,
-    pub size_bytes: usize,
+    pub time_start_ns: i64,  // this series' earliest timestamp in this chunk
+    pub time_end_ns: i64,    // this series' latest timestamp in this chunk
+    pub size_bytes: usize,   // byte footprint of this series' columns in the file
 }
 
-/// Per-chunk value statistics used for predicate pushdown.
-/// Stored alongside SeriesChunkEntry in the ChunkIndex.
-/// Computed during the chunk write from the raw value column.
+/// Value statistics for one series within one chunk — used for predicate pushdown.
+/// Stored in `ChunkIndex.chunk_stats` keyed by (ChunkId, SeriesId).
+/// Series-level: min/max reflect only this series' values, not the whole file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeriesChunkStats {
     pub min_value: f64,
@@ -88,4 +90,13 @@ impl SeriesChunkStats {
             null_count: 0,
         })
     }
+}
+
+/// Chunk-level metadata stored in `ChunkIndex.chunk_files` keyed by ChunkId.
+/// Describes the chunk file as a whole — shared by all series flushed together.
+/// Used by the compaction worker to locate files and group them by size.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChunkMeta {
+    pub file_path: PathBuf,
+    pub file_size: u64,
 }

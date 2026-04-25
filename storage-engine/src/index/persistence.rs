@@ -17,7 +17,7 @@ struct IndexSnapshot {
     series_registry: Vec<(SeriesId, SeriesKey)>,
     time_index: Vec<(SeriesId, Vec<(i64, SeriesChunkEntry)>)>,
     chunk_stats: Vec<(ChunkId, SeriesId, SeriesChunkStats)>,
-    file_sizes: Vec<(ChunkId, u64)>,
+    chunk_files: Vec<(ChunkId, ChunkMeta)>,
 }
 
 pub async fn save_index(index: &ChunkIndex, path: &Path, last_wal_sequence: u64) -> Result<()> {
@@ -48,10 +48,10 @@ pub async fn save_index(index: &ChunkIndex, path: &Path, last_wal_sequence: u64)
             .map(|((cid, sid), stat)| (*cid, *sid, stat.clone()))
             .collect(),
 
-        file_sizes: index
-            .file_sizes
+        chunk_files: index
+            .chunk_files
             .iter()
-            .map(|(cid, size)| (*cid, *size))
+            .map(|(cid, meta)| (*cid, meta.clone()))
             .collect(),
     };
 
@@ -111,10 +111,10 @@ fn rebuild_index(snapshot: IndexSnapshot) -> ChunkIndex {
             .iter()
             .map(|(cid, sid, stat)| ((*cid, *sid), stat.clone()))
             .collect(),
-        file_sizes: snapshot
-            .file_sizes
+        chunk_files: snapshot
+            .chunk_files
             .iter()
-            .map(|(cid, size)| (*cid, *size))
+            .map(|(cid, meta)| (*cid, meta.clone()))
             .collect(),
         ..ChunkIndex::default()
     }

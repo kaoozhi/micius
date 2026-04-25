@@ -57,7 +57,7 @@ pub async fn write_and_read_bytes(
     let dir = tempdir().expect("failed to create temp dir");
     let writer = ChunkWriter::new(dir.path());
     let result = writer.write(data).await.expect("chunk write failed");
-    let bytes = std::fs::read(&result.file_path).expect("failed to read chunk file");
+    let bytes = std::fs::read(&result.chunk_meta.file_path).expect("failed to read chunk file");
     (dir, result, bytes)
 }
 
@@ -68,7 +68,7 @@ pub async fn write_chunk(
     let dir = tempdir().expect("failed to create temp dir");
     let writer = ChunkWriter::new(dir.path());
     let result = writer.write(data).await.expect("chunk write failed");
-    let path = result.file_path;
+    let path = result.chunk_meta.file_path;
     (dir, path)
 }
 

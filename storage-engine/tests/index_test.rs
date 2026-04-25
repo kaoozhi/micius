@@ -28,7 +28,7 @@ async fn test_single_tag_resolution() {
             &s.series_key,
             s.entry.clone(),
             s.stats.clone(),
-            write_result.file_size,
+            write_result.chunk_meta.clone(),
         );
     }
 
@@ -75,7 +75,7 @@ async fn test_multi_tag_intersection() {
             &s.series_key,
             s.entry.clone(),
             s.stats.clone(),
-            write_result.file_size,
+            write_result.chunk_meta.clone(),
         );
     }
 
@@ -114,7 +114,7 @@ async fn test_no_match_tags() {
             &s.series_key,
             s.entry.clone(),
             s.stats.clone(),
-            write_result.file_size,
+            write_result.chunk_meta.clone(),
         );
     }
 
@@ -162,7 +162,7 @@ async fn test_time_range_pruning() {
                 &s.series_key,
                 s.entry.clone(),
                 s.stats.clone(),
-                write_result.file_size,
+                write_result.chunk_meta.clone(),
             );
         }
         dirs.push(dir);
@@ -214,7 +214,7 @@ async fn test_stats_predicate_gt() {
                 &s.series_key,
                 s.entry.clone(),
                 s.stats.clone(),
-                write_result.file_size,
+                write_result.chunk_meta.clone(),
             );
         }
         dirs.push(dir);
@@ -263,7 +263,7 @@ async fn test_stats_predicate_between() {
                 &s.series_key,
                 s.entry.clone(),
                 s.stats.clone(),
-                write_result.file_size,
+                write_result.chunk_meta.clone(),
             );
         }
         dirs.push(dir);
@@ -307,7 +307,7 @@ async fn test_register_deregister() {
         &s.series_key,
         s.entry.clone(),
         s.stats.clone(),
-        write_result.file_size,
+        write_result.chunk_meta.clone(),
     );
 
     let series_id = SeriesId::from(&key);
@@ -350,7 +350,7 @@ async fn test_persistence_roundtrip_single_series() {
                 &s.series_key,
                 s.entry.clone(),
                 s.stats.clone(),
-                write_result.file_size,
+                write_result.chunk_meta.clone(),
             );
         }
         dirs.push(dir);
@@ -404,7 +404,7 @@ async fn test_persistence_roundtrip_multi_series() {
             &s.series_key,
             s.entry.clone(),
             s.stats.clone(),
-            write_result.file_size,
+            write_result.chunk_meta.clone(),
         );
     }
 

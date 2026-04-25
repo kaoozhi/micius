@@ -9,7 +9,7 @@ pub struct ChunkIndex {
     pub chunk_stats: HashMap<(ChunkId, SeriesId), SeriesChunkStats>, // Chunk stats map per ChunkID
     /// File sizes keyed by ChunkId — used by the compaction worker to group
     /// chunks by size without opening any files.
-    pub file_sizes: HashMap<ChunkId, u64>, // Chunk size map per ChunkID
+    pub chunk_files: HashMap<ChunkId, ChunkMeta>, // Chunk size map per ChunkID
 }
 
 impl ChunkIndex {
@@ -22,9 +22,9 @@ impl ChunkIndex {
     pub fn register(
         &mut self,
         series_key: &SeriesKey,
-        meta: SeriesChunkEntry,
+        entry: SeriesChunkEntry,
         stats: SeriesChunkStats,
-        file_size: u64,
+        meta: ChunkMeta,
     ) -> SeriesId {
         let series_id = SeriesId::from(series_key);
 
@@ -44,15 +44,15 @@ impl ChunkIndex {
         }
 
         // register time index
-        let chunk_id = meta.chunk_id;
-        let time_start_ns = meta.time_start_ns;
+        let chunk_id = entry.chunk_id;
+        let time_start_ns = entry.time_start_ns;
         self.time_index
             .entry(series_id)
             .or_default()
-            .insert(time_start_ns, meta);
+            .insert(time_start_ns, entry);
 
         self.chunk_stats.insert((chunk_id, series_id), stats);
-        self.file_sizes.insert(chunk_id, file_size);
+        self.chunk_files.insert(chunk_id, meta);
         series_id
     }
 
@@ -65,7 +65,7 @@ impl ChunkIndex {
         self.chunk_stats.remove(&(chunk_id, series_id));
         let chunk_still_referenced = self.chunk_stats.keys().any(|(cid, _)| *cid == chunk_id);
         if !chunk_still_referenced {
-            self.file_sizes.remove(&chunk_id);
+            self.chunk_files.remove(&chunk_id);
         }
     }
 
@@ -185,7 +185,7 @@ impl ChunkIndex {
 
     /// Number of distinct chunk files — used by compaction for size grouping.
     pub fn chunk_file_count(&self) -> usize {
-        self.file_sizes.len()
+        self.chunk_files.len()
     }
 }
 
