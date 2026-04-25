@@ -1,6 +1,6 @@
 // The ChunkWriter takes a `BTreeMap<SeriesKey, Vec<(i64, f64)>>` — the
 // drained memtable contents — and writes it to a single immutable `.mcs`
-// file on disk. It also computes the ChunkMeta and ChunkStats for each
+// file on disk. It also computes the SeriesChunkEntry and SeriesChunkStats for each
 // series so the ChunkIndex can be updated after the write.
 
 // ### Two-pass approach
@@ -99,6 +99,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
+#[derive(Default)]
 pub struct ChunkWriter {
     chunk_dir: PathBuf,
 }
@@ -114,8 +115,8 @@ pub struct ChunkWriteResult {
 
 pub struct SeriesWriteResult {
     pub series_key: SeriesKey,
-    pub meta: ChunkMeta,
-    pub stats: ChunkStats,
+    pub entry: SeriesChunkEntry,
+    pub stats: SeriesChunkStats,
 }
 
 struct EncodedSeries {
@@ -126,7 +127,7 @@ struct EncodedSeries {
     time_end_ns: i64,
     ts_compressed: Vec<u8>,  // lz4-compressed delta-encoded timestamps
     val_compressed: Vec<u8>, // lz4-compressed f64 values
-    stats: ChunkStats,
+    stats: SeriesChunkStats,
 }
 
 fn build_directory_entry(s: &EncodedSeries, ts_offset: u64, val_offset: u64) -> Vec<u8> {
@@ -171,7 +172,7 @@ impl ChunkWriter {
             }
             let (timestamps, values): (Vec<i64>, Vec<f64>) = points.iter().copied().unzip();
             let deltas = delta_encode(&timestamps);
-            let stats = ChunkStats::from_values(&values)
+            let stats = SeriesChunkStats::from_values(&values)
                 .ok_or_else(|| anyhow::anyhow!("no chunk stats found"))?;
 
             global_min_ts =
@@ -220,12 +221,11 @@ impl ChunkWriter {
             offsets.push((ts_offset, val_offset));
             series_results.push(SeriesWriteResult {
                 series_key: s.key.clone(),
-                meta: ChunkMeta {
+                entry: SeriesChunkEntry {
                     chunk_id,
                     series_id: (&s.key).into(),
                     time_start_ns: s.time_start_ns,
                     time_end_ns: s.time_end_ns,
-                    file_path: file_path.clone(),
                     size_bytes: s.ts_compressed.len() + s.val_compressed.len() + U32_SIZE * 2,
                 },
                 stats: s.stats.clone(),

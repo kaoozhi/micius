@@ -1,4 +1,5 @@
 pub mod chunk;
+// pub mod compaction;
 pub mod config;
 pub mod index;
 pub mod memtable;

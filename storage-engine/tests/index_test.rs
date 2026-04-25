@@ -26,7 +26,7 @@ async fn test_single_tag_resolution() {
     for s in write_result.series_results.iter() {
         index.register(
             &s.series_key,
-            s.meta.clone(),
+            s.entry.clone(),
             s.stats.clone(),
             write_result.file_size,
         );
@@ -73,7 +73,7 @@ async fn test_multi_tag_intersection() {
     for s in &write_result.series_results {
         index.register(
             &s.series_key,
-            s.meta.clone(),
+            s.entry.clone(),
             s.stats.clone(),
             write_result.file_size,
         );
@@ -112,7 +112,7 @@ async fn test_no_match_tags() {
     for s in &write_result.series_results {
         index.register(
             &s.series_key,
-            s.meta.clone(),
+            s.entry.clone(),
             s.stats.clone(),
             write_result.file_size,
         );
@@ -160,7 +160,7 @@ async fn test_time_range_pruning() {
         for s in &write_result.series_results {
             index.register(
                 &s.series_key,
-                s.meta.clone(),
+                s.entry.clone(),
                 s.stats.clone(),
                 write_result.file_size,
             );
@@ -212,7 +212,7 @@ async fn test_stats_predicate_gt() {
         for s in &write_result.series_results {
             index.register(
                 &s.series_key,
-                s.meta.clone(),
+                s.entry.clone(),
                 s.stats.clone(),
                 write_result.file_size,
             );
@@ -261,7 +261,7 @@ async fn test_stats_predicate_between() {
         for s in &write_result.series_results {
             index.register(
                 &s.series_key,
-                s.meta.clone(),
+                s.entry.clone(),
                 s.stats.clone(),
                 write_result.file_size,
             );
@@ -305,7 +305,7 @@ async fn test_register_deregister() {
     let mut index = ChunkIndex::new();
     index.register(
         &s.series_key,
-        s.meta.clone(),
+        s.entry.clone(),
         s.stats.clone(),
         write_result.file_size,
     );
@@ -317,7 +317,7 @@ async fn test_register_deregister() {
     assert_eq!(before.len(), 1, "chunk should be visible after register");
 
     // Deregister using the chunk's own metadata
-    index.deregister(series_id, s.meta.chunk_id, s.meta.time_start_ns);
+    index.deregister(series_id, s.entry.chunk_id, s.entry.time_start_ns);
 
     // After deregister: chunk is gone
     assert_eq!(
@@ -346,14 +346,21 @@ async fn test_persistence_roundtrip_single_series() {
         time_start += step_ns * 10;
         let (dir, write_result) = write_chunk_with_results(data).await;
         for s in &write_result.series_results {
-            index.register(&s.series_key, s.meta.clone(), s.stats.clone(), write_result.file_size);
+            index.register(
+                &s.series_key,
+                s.entry.clone(),
+                s.stats.clone(),
+                write_result.file_size,
+            );
         }
         dirs.push(dir);
     }
 
     let snap_dir = tempdir().unwrap();
     let snap_path = snap_dir.path().join("index.bin");
-    save_index(&index, &snap_path, wal_sequence).await.expect("save failed");
+    save_index(&index, &snap_path, wal_sequence)
+        .await
+        .expect("save failed");
 
     let (loaded, loaded_seq) = load_index(&snap_path)
         .await
@@ -383,22 +390,29 @@ async fn test_persistence_roundtrip_multi_series() {
     // 3 series (2 cpu, 1 mem) in one chunk file — verify metric separation after reload.
     let key_cpu1 = series_key("cpu", "web1");
     let key_cpu2 = series_key("cpu", "web2");
-    let key_mem  = series_key("mem", "db1");
+    let key_mem = series_key("mem", "db1");
 
     let mut data = BTreeMap::new();
     data.insert(key_cpu1.clone(), make_points(0, 1_000_000_000, 10));
     data.insert(key_cpu2.clone(), make_points(0, 1_000_000_000, 10));
-    data.insert(key_mem.clone(),  make_points(0, 1_000_000_000, 10));
+    data.insert(key_mem.clone(), make_points(0, 1_000_000_000, 10));
 
     let (_dir, write_result) = write_chunk_with_results(data).await;
     let mut index = ChunkIndex::new();
     for s in &write_result.series_results {
-        index.register(&s.series_key, s.meta.clone(), s.stats.clone(), write_result.file_size);
+        index.register(
+            &s.series_key,
+            s.entry.clone(),
+            s.stats.clone(),
+            write_result.file_size,
+        );
     }
 
     let snap_dir = tempdir().unwrap();
     let snap_path = snap_dir.path().join("index.bin");
-    save_index(&index, &snap_path, 0).await.expect("save failed");
+    save_index(&index, &snap_path, 0)
+        .await
+        .expect("save failed");
 
     let (loaded, _) = load_index(&snap_path)
         .await
@@ -422,6 +436,8 @@ async fn test_persistence_roundtrip_multi_series() {
 async fn test_persistence_missing_file_returns_none() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("nonexistent.bin");
-    let result = load_index(&path).await.expect("should not error on missing file");
+    let result = load_index(&path)
+        .await
+        .expect("should not error on missing file");
     assert!(result.is_none());
 }

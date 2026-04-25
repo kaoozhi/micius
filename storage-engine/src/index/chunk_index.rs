@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 #[derive(Default)]
 pub struct ChunkIndex {
     pub series_registry: HashMap<SeriesId, SeriesKey>, // Reverse map between SeriesId and SeriesKey, for O(1) metric-name lookup during query filtering
-    pub time_index: HashMap<SeriesId, BTreeMap<i64, ChunkMeta>>, // a sorted map from chunk start time to chunk metadata per SeriesID
+    pub time_index: HashMap<SeriesId, BTreeMap<i64, SeriesChunkEntry>>, // a sorted map from chunk start time to chunk metadata per SeriesID
     pub tag_index: HashMap<(String, String), HashSet<SeriesId>>, // Inverted tag index (tag key, tag value) map with SeriesID
-    pub chunk_stats: HashMap<(ChunkId, SeriesId), ChunkStats>,   // Chunk stats map per ChunkID
+    pub chunk_stats: HashMap<(ChunkId, SeriesId), SeriesChunkStats>, // Chunk stats map per ChunkID
     /// File sizes keyed by ChunkId — used by the compaction worker to group
     /// chunks by size without opening any files.
     pub file_sizes: HashMap<ChunkId, u64>, // Chunk size map per ChunkID
@@ -22,8 +22,8 @@ impl ChunkIndex {
     pub fn register(
         &mut self,
         series_key: &SeriesKey,
-        meta: ChunkMeta,
-        stats: ChunkStats,
+        meta: SeriesChunkEntry,
+        stats: SeriesChunkStats,
         file_size: u64,
     ) -> SeriesId {
         let series_id = SeriesId::from(series_key);
@@ -154,7 +154,7 @@ impl ChunkIndex {
         time_start_ns: i64,
         time_end_ns: i64,
         predicate: Option<&ValuePredicate>,
-    ) -> Vec<ChunkMeta> {
+    ) -> Vec<SeriesChunkEntry> {
         let Some(time_map) = self.time_index.get(series_id) else {
             return vec![];
         };

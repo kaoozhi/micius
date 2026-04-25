@@ -1,7 +1,4 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
-
-// use crate::chunk::format::HEADER_SIZE;
 
 /// A single measurement at a point in time
 #[derive(Debug, Clone, PartialEq)]
@@ -63,26 +60,25 @@ pub type Sequence = u64;
 /// Does not contain the chunk data itself — only enough information
 /// to locate and evaluate the chunk during query planning.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChunkMeta {
+pub struct SeriesChunkEntry {
     pub chunk_id: ChunkId,
     pub series_id: SeriesId,
     pub time_start_ns: i64,
     pub time_end_ns: i64,
-    pub file_path: PathBuf,
     pub size_bytes: usize,
 }
 
 /// Per-chunk value statistics used for predicate pushdown.
-/// Stored alongside ChunkMeta in the ChunkIndex.
+/// Stored alongside SeriesChunkEntry in the ChunkIndex.
 /// Computed during the chunk write from the raw value column.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChunkStats {
+pub struct SeriesChunkStats {
     pub min_value: f64,
     pub max_value: f64,
     pub null_count: u64, // reserved for future nullable value support
 }
 
-impl ChunkStats {
+impl SeriesChunkStats {
     pub fn from_values(values: &[f64]) -> Option<Self> {
         let min = values.iter().cloned().reduce(f64::min)?;
         let max = values.iter().cloned().reduce(f64::max)?;

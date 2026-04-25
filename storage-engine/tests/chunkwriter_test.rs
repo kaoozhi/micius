@@ -89,17 +89,17 @@ async fn test_series_write_result_per_series_metadata() {
     assert_eq!(result.series_results.len(), 2);
 
     for sr in &result.series_results {
-        assert_eq!(sr.meta.chunk_id, result.chunk_id);
-        assert!(sr.meta.time_start_ns <= sr.meta.time_end_ns);
+        assert_eq!(sr.entry.chunk_id, result.chunk_id);
+        assert!(sr.entry.time_start_ns <= sr.entry.time_end_ns);
 
         if sr.series_key == key_a {
-            assert_eq!(sr.meta.time_start_ns, 1000);
-            assert_eq!(sr.meta.time_end_ns, 1200); // 1000 + 2 * 100
+            assert_eq!(sr.entry.time_start_ns, 1000);
+            assert_eq!(sr.entry.time_end_ns, 1200); // 1000 + 2 * 100
             assert_eq!(sr.stats.min_value, 0.0);
             assert_eq!(sr.stats.max_value, 2.0);
         } else if sr.series_key == key_b {
-            assert_eq!(sr.meta.time_start_ns, 5000);
-            assert_eq!(sr.meta.time_end_ns, 5100); // 5000 + 1 * 100
+            assert_eq!(sr.entry.time_start_ns, 5000);
+            assert_eq!(sr.entry.time_end_ns, 5100); // 5000 + 1 * 100
             assert_eq!(sr.stats.min_value, 0.0);
             assert_eq!(sr.stats.max_value, 1.0);
         } else {
@@ -136,10 +136,10 @@ async fn test_multi_series_global_time_bounds() {
         .find(|r| r.series_key == key_b)
         .unwrap();
 
-    assert_eq!(sr_a.meta.time_start_ns, 100);
-    assert_eq!(sr_a.meta.time_end_ns, 300);
-    assert_eq!(sr_b.meta.time_start_ns, 50);
-    assert_eq!(sr_b.meta.time_end_ns, 400);
+    assert_eq!(sr_a.entry.time_start_ns, 100);
+    assert_eq!(sr_a.entry.time_end_ns, 300);
+    assert_eq!(sr_b.entry.time_start_ns, 50);
+    assert_eq!(sr_b.entry.time_end_ns, 400);
 }
 
 #[tokio::test]

@@ -15,8 +15,8 @@ struct IndexSnapshot {
     version: u8,
     last_wal_sequence: u64,
     series_registry: Vec<(SeriesId, SeriesKey)>,
-    time_index: Vec<(SeriesId, Vec<(i64, ChunkMeta)>)>,
-    chunk_stats: Vec<(ChunkId, SeriesId, ChunkStats)>,
+    time_index: Vec<(SeriesId, Vec<(i64, SeriesChunkEntry)>)>,
+    chunk_stats: Vec<(ChunkId, SeriesId, SeriesChunkStats)>,
     file_sizes: Vec<(ChunkId, u64)>,
 }
 
@@ -90,7 +90,7 @@ fn rebuild_index(snapshot: IndexSnapshot) -> ChunkIndex {
             .time_index
             .into_iter()
             .map(|(sid, time_vec)| {
-                let timemap: BTreeMap<i64, ChunkMeta> = time_vec.into_iter().collect();
+                let timemap: BTreeMap<i64, SeriesChunkEntry> = time_vec.into_iter().collect();
                 (sid, timemap)
             })
             .collect(),
