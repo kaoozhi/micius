@@ -59,7 +59,11 @@ impl ChunkIndex {
     /// Remove a chunk from the index — called after compaction deletes old chunks.
     pub fn deregister(&mut self, series_id: SeriesId, chunk_id: ChunkId, time_start_ns: i64) {
         if let Some(time_map) = self.time_index.get_mut(&series_id) {
-            time_map.remove(&time_start_ns);
+            // Guard by chunk_id: if a newly registered merged chunk occupies the same
+            // time_start_ns, its entry must not be removed.
+            if time_map.get(&time_start_ns).map(|e| e.chunk_id) == Some(chunk_id) {
+                time_map.remove(&time_start_ns);
+            }
         }
 
         self.chunk_stats.remove(&(chunk_id, series_id));

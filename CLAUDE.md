@@ -463,14 +463,19 @@ Do not start the next phase until the current gate passes.
 ### Phase 1 gate
 All of the following tests must pass:
 ```
-cargo test wal::tests::wal_recovery_after_crash
-cargo test wal::tests::torn_write_detection
-cargo test chunk::tests::chunk_write_read_roundtrip
-cargo test chunk::tests::bloom_filter_false_positive_rate
-cargo test index::tests::multi_tag_intersection
-cargo test index::tests::time_range_pruning
-cargo test index::tests::predicate_pushdown_skips_chunk
-cargo test compaction::tests::compacted_chunks_queryable
+cargo nextest run --test wal_test test_append_and_recover
+cargo nextest run --test wal_test test_torn_write_stops_recovery
+cargo nextest run --test chunkwriter_test test_bloom_filter_in_footer
+cargo nextest run --test chunkreader_test test_read_single_series_roundtrip
+cargo nextest run --test index_test test_multi_tag_intersection
+cargo nextest run --test index_test test_time_range_pruning
+cargo nextest run --test index_test test_stats_predicate_gt
+cargo nextest run --test compaction_test tests::compacted_chunks_queryable
+```
+
+Or run all gate tests in one shot:
+```
+cargo nextest run
 ```
 
 ### Phase 2 gate
