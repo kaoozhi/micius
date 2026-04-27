@@ -3,6 +3,7 @@ pub mod compaction;
 pub mod config;
 pub mod index;
 pub mod memtable;
+pub mod server;
 pub mod types;
 pub mod wal;
 pub mod proto {
