@@ -174,10 +174,11 @@ impl ChunkWriter {
             let stats = SeriesChunkStats::from_values(&values)
                 .ok_or_else(|| anyhow::anyhow!("no chunk stats found"))?;
 
-            global_min_ts =
-                global_min_ts.min(*timestamps.first().expect("non-empty: guarded above"));
-            global_max_ts =
-                global_max_ts.max(*timestamps.last().expect("non-empty: guarded above"));
+            let time_start_ns = timestamps[0];
+            let time_end_ns = timestamps[timestamps.len() - 1];
+
+            global_min_ts = global_min_ts.min(time_start_ns);
+            global_max_ts = global_max_ts.max(time_end_ns);
             total_entries += timestamps.len() as u32;
 
             let ts_bytes = i64_slice_to_bytes(&deltas);
@@ -192,8 +193,8 @@ impl ChunkWriter {
                 key: key.clone(),
                 key_bytes,
                 entry_count: timestamps.len() as u32,
-                time_start_ns: *timestamps.first().expect("non-empty: guarded above"),
-                time_end_ns: *timestamps.last().expect("non-empty: guarded above"),
+                time_start_ns,
+                time_end_ns,
                 ts_compressed,
                 val_compressed,
                 stats,
