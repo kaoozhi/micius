@@ -192,19 +192,3 @@ impl ChunkIndex {
         self.chunk_files.len()
     }
 }
-
-pub enum ValuePredicate {
-    GreaterThan(f64),
-    LessThan(f64),
-    Between(f64, f64),
-}
-
-impl ValuePredicate {
-    pub fn matches(&self, min_val: f64, max_val: f64) -> bool {
-        match self {
-            Self::GreaterThan(t) => max_val > *t,
-            Self::LessThan(t) => min_val < *t,
-            Self::Between(lo, hi) => min_val <= *hi && max_val >= *lo,
-        }
-    }
-}

@@ -118,3 +118,27 @@ pub struct ChunkMeta {
     pub file_path: PathBuf,
     pub file_size: u64,
 }
+
+pub enum ValuePredicate {
+    GreaterThan(f64),
+    LessThan(f64),
+    Between(f64, f64),
+}
+
+impl ValuePredicate {
+    pub fn matches(&self, min_val: f64, max_val: f64) -> bool {
+        match self {
+            Self::GreaterThan(t) => max_val > *t,
+            Self::LessThan(t) => min_val < *t,
+            Self::Between(lo, hi) => min_val <= *hi && max_val >= *lo,
+        }
+    }
+
+    pub fn satisfies(&self, value: f64) -> bool {
+        match self {
+            Self::GreaterThan(t) => value > *t,
+            Self::LessThan(t) => value < *t,
+            Self::Between(lo, hi) => value >= *lo && value <= *hi,
+        }
+    }
+}

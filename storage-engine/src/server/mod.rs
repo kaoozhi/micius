@@ -28,8 +28,6 @@ pub struct StorageServer {
 
 #[tonic::async_trait]
 impl StorageService for StorageServer {
-    type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
-
     async fn append(
         &self,
         request: Request<AppendRequest>,
@@ -122,7 +120,7 @@ impl StorageService for StorageServer {
     ) -> Result<Response<CompactResponse>, Status> {
         todo!()
     }
-
+    type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
     async fn query(
         &self,
         request: Request<QueryRequest>,

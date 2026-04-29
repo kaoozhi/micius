@@ -280,7 +280,3 @@ fn retrieve_data(
         .collect();
     Ok(points)
 }
-
-// fn reconstruct_entries() -> Result<Option<BTreeMap<SeriesKey, Vec<(i64, f64)>>>> {
-//     Ok(())
-// }

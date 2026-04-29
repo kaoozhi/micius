@@ -1,5 +1,5 @@
-use crate::types::{DataPoint, SeriesKey};
-use std::collections::BTreeMap;
+use crate::types::{DataPoint, SeriesKey, ValuePredicate};
+use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 
 pub struct Memtable {
@@ -58,5 +58,58 @@ impl Memtable {
         self.size_bytes = 0usize;
         self.entry_count = 0;
         std::mem::take(&mut self.entries)
+    }
+
+    pub fn resolve_series(
+        &self,
+        metric: &str,
+        tag_filters: &HashMap<String, String>,
+    ) -> Vec<SeriesKey> {
+        if tag_filters.is_empty() {
+            return self
+                .entries
+                .iter()
+                .filter(|(sk, _)| sk.metric_name == metric)
+                .map(|(sk, _)| sk.clone())
+                .collect();
+        }
+
+        self.entries
+            .iter()
+            .filter(|(sk, _)| sk.metric_name == metric)
+            .filter(|(sk, _)| {
+                tag_filters.iter().all(|(tag_key, tag_val)| {
+                    let Some(val) = sk.tags.get(tag_key) else {
+                        return false;
+                    };
+                    val == tag_val
+                })
+            })
+            .map(|(sk, _)| sk.clone())
+            .collect()
+    }
+
+    pub fn read_series(
+        &self,
+        series_key: &SeriesKey,
+        time_start_ns: i64,
+        time_end_ns: i64,
+        predicate: Option<&ValuePredicate>,
+    ) -> Vec<DataPoint> {
+        let Some(time_map) = self.entries.get(series_key) else {
+            return vec![];
+        };
+
+        time_map
+            .iter()
+            .filter(|(ts, _)| time_start_ns <= *ts && time_end_ns >= *ts)
+            .filter(|(_, val)| predicate.map_or(true, |p| p.satisfies(*val)))
+            .map(|(ts, val)| DataPoint {
+                metric_name: series_key.metric_name.clone(),
+                tags: series_key.tags.clone(),
+                timestamp_ns: *ts,
+                value: *val,
+            })
+            .collect()
     }
 }

@@ -3,7 +3,7 @@ mod common;
 
 use common::*;
 use std::collections::{BTreeMap, HashMap};
-use storage_engine::index::chunk_index::{ChunkIndex, ValuePredicate};
+use storage_engine::index::chunk_index::ChunkIndex;
 use storage_engine::index::persistence::{load_index, save_index};
 use storage_engine::types::*;
 use tempfile::tempdir;
