@@ -1,4 +1,4 @@
-#![allow(unused)]
+// #![allow(unused)]
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -40,9 +40,9 @@ pub struct StorageConfig {
 impl StorageConfig {
     pub fn load() -> Result<Self> {
         Ok(Self {
-            wal_dir: env_path("MICIUS_WAL_DIR", "/var/micius/wal"),
-            chunk_dir: env_path("MICIUS_CHUNK_DIR", "/var/micius/chunks"),
-            index_path: env_path("MICIUS_INDEX_PATH", "/var/micius/index.json"),
+            wal_dir: env_path("MICIUS_WAL_DIR", "/var/micius/data/wal"),
+            chunk_dir: env_path("MICIUS_CHUNK_DIR", "/var/micius/data/chunks"),
+            index_path: env_path("MICIUS_INDEX_PATH", "/var/micius/data/index.bin"),
             wal_max_segment_bytes: env_u64("MICIUS_WAL_MAX_SEGMENT_MB", 64) * 1024 * 1024,
             memtable_flush_threshold_bytes: env_usize("MICIUS_MEMTABLE_FLUSH_MB", 32) * 1024 * 1024,
             compaction_interval_secs: env_u64("MICIUS_COMPACTION_INTERVAL_SECS", 300),
@@ -51,6 +51,16 @@ impl StorageConfig {
             grpc_addr: env_string("MICIUS_GRPC_ADDR", "0.0.0.0:50051"),
             metrics_addr: env_string("MICIUS_METRICS_ADDR", "0.0.0.0:9091"),
         })
+    }
+
+    pub async fn ensure_dirs(&self) -> Result<()> {
+        tokio::fs::create_dir_all(&self.wal_dir).await?;
+        tokio::fs::create_dir_all(&self.chunk_dir).await?;
+        // index_path's parent directory
+        if let Some(parent) = self.index_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        Ok(())
     }
 }
 
@@ -99,7 +109,7 @@ mod tests {
 
         let config = StorageConfig::load().unwrap();
 
-        assert_eq!(config.wal_dir, PathBuf::from("/var/micius/wal"));
+        assert_eq!(config.wal_dir, PathBuf::from("/var/micius/data/wal"));
         assert_eq!(config.grpc_addr, "0.0.0.0:50051");
         assert_eq!(config.wal_max_segment_bytes, 64 * 1024 * 1024);
     }
