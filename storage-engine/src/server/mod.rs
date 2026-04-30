@@ -3,13 +3,14 @@ use crate::{
     chunk::reader::ChunkReader,
     chunk::writer::ChunkWriter,
     compaction::CompactionWorker,
-    index::chunk_index::ChunkIndex,
+    config::StorageConfig,
+    index::{self, chunk_index::ChunkIndex},
     memtable::Memtable,
     proto::storage::v1::{
         AppendRequest, AppendResponse, CompactRequest, CompactResponse, QueryRequest,
         QueryResponse, SnapshotRequest, SnapshotResponse, storage_service_server::StorageService,
     },
-    wal::writer::WalWriter,
+    wal::{self, writer::WalWriter},
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -19,12 +20,110 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub struct StorageServer {
-    pub wal: Arc<Mutex<WalWriter>>,
-    pub memtable: Arc<Mutex<Memtable>>,
-    pub index: Arc<RwLock<ChunkIndex>>,
-    pub chunk_writer: Arc<ChunkWriter>,
+    pub wal:               Arc<Mutex<WalWriter>>,
+    pub memtable:          Arc<Mutex<Memtable>>,
+    pub index:             Arc<RwLock<ChunkIndex>>,
+    pub chunk_writer:      Arc<ChunkWriter>,
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
-    pub snapshot_path: PathBuf,
+    pub snapshot_path:     PathBuf,
+}
+
+impl StorageServer {
+    /// Opens the storage engine at the paths described by `config`, running
+    /// crash recovery if needed, and returns a ready-to-use server.
+    ///
+    /// Handles three cases transparently:
+    ///   - First start: no snapshot, no WAL → fresh empty server
+    ///   - Crash recovery: loads snapshot, replays WAL delta, flushes to disk
+    ///   - Graceful restart: loads recent snapshot, minimal WAL replay
+    ///
+    /// The caller is responsible for starting background tasks (compaction,
+    /// periodic snapshot) and binding the gRPC listener.
+    /// `config.ensure_dirs()` must be called before this.
+    pub async fn open(config: &StorageConfig) -> anyhow::Result<Self> {
+        // 1. Index snapshot ─────────────────────────────────────────────────
+        // None = first run or missing snapshot → start from empty index.
+        let (mut idx, last_seq) =
+            match index::persistence::load_index(&config.index_path).await? {
+                None => (ChunkIndex::new(), 0),
+                Some((idx, seq)) => (idx, seq),
+            };
+        tracing::info!(
+            series = idx.series_count(),
+            chunks = idx.chunk_file_count(),
+            last_seq,
+            "index snapshot loaded"
+        );
+
+        // 2. WAL replay ─────────────────────────────────────────────────────
+        // Verifies CRC32 per frame, stops at first torn write.
+        // Returns only the points not yet flushed to chunk files.
+        let recovery = wal::recovery::recover(&config.wal_dir).await?;
+        tracing::info!(
+            points   = recovery.points.len(),
+            segments = recovery.segments_replayed,
+            last_seq = recovery.last_sequence,
+            "WAL recovered"
+        );
+
+        // 3. Flush recovered points ─────────────────────────────────────────
+        // Bypass the size threshold — on open we always flush to a clean slate.
+        let mut memtable = Memtable::new(config.memtable_flush_threshold_bytes);
+        if !recovery.points.is_empty() {
+            for point in recovery.points {
+                memtable.insert(point);
+            }
+            let results = ChunkWriter::new(&config.chunk_dir)
+                .write(memtable.drain())
+                .await?;
+            let meta = results.chunk_meta;
+            for s in results.series_results {
+                idx.register(&s.series_key, s.entry, s.stats, meta.clone());
+            }
+            tracing::info!(chunk = ?meta.file_path, "recovery chunk written");
+        }
+
+        // 4. WAL writer + segment cleanup ───────────────────────────────────
+        // Resume from recovery.last_sequence so new appends don't reuse
+        // already-assigned sequence numbers. u64::MAX covers all pre-existing
+        // completed segments — they were fully replayed above.
+        let mut wal_writer = WalWriter::open(
+            &config.wal_dir,
+            config.wal_max_segment_bytes,
+            recovery.last_sequence,
+        )
+        .await?;
+
+        let to_delete = wal_writer.drain_completed_before(u64::MAX);
+        for path in &to_delete {
+            if let Err(e) = tokio::fs::remove_file(path).await {
+                tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
+            }
+        }
+        tracing::info!(deleted = to_delete.len(), "WAL segments cleaned up");
+
+        // 5. Wrap in Arc ────────────────────────────────────────────────────
+        let wal    = Arc::new(Mutex::new(wal_writer));
+        let mem    = Arc::new(Mutex::new(memtable));
+        let index  = Arc::new(RwLock::new(idx));
+        let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));
+
+        let compaction_worker = Arc::new(Mutex::new(CompactionWorker::new(
+            Arc::clone(&index),
+            Arc::clone(&writer),
+            config.compaction_min_threshold,
+            config.compaction_size_ratio,
+        )));
+
+        Ok(Self {
+            wal,
+            memtable:          mem,
+            index,
+            chunk_writer:      writer,
+            compaction_worker,
+            snapshot_path:     config.index_path.clone(),
+        })
+    }
 }
 
 #[tonic::async_trait]
