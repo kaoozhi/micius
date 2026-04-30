@@ -12,6 +12,7 @@ use crate::{
     wal::writer::WalWriter,
 };
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_stream::wrappers::ReceiverStream;
@@ -23,6 +24,7 @@ pub struct StorageServer {
     pub index: Arc<RwLock<ChunkIndex>>,
     pub chunk_writer: Arc<ChunkWriter>,
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
+    pub snapshot_path: PathBuf,
 }
 
 #[tonic::async_trait]
@@ -267,8 +269,18 @@ impl StorageService for StorageServer {
     }
     async fn snapshot(
         &self,
-        request: Request<SnapshotRequest>,
+        _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
-        todo!()
+        // todo!()
+        let seq = self.wal.lock().await.current_sequence();
+        let index = self.index.read().await;
+
+        crate::index::persistence::save_index(&index, &self.snapshot_path, seq)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(SnapshotResponse {
+            snapshot_path: self.snapshot_path.to_string_lossy().into_owned(),
+        }))
     }
 }
