@@ -250,9 +250,20 @@ impl StorageService for StorageServer {
     }
     async fn compact(
         &self,
-        request: Request<CompactRequest>,
+        _request: Request<CompactRequest>,
     ) -> Result<Response<CompactResponse>, Status> {
-        todo!()
+        let result = self
+            .compaction_worker
+            .lock()
+            .await
+            .compact_once()
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+
+        Ok(Response::new(CompactResponse {
+            chunks_merged: result.chunks_merged,
+            bytes_freed: result.bytes_freed,
+        }))
     }
     async fn snapshot(
         &self,

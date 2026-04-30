@@ -94,6 +94,7 @@ message CompactRequest {
 message CompactResponse {
   // Number of chunk files merged in this pass.
   uint32 chunks_merged = 1;
+  uint64 bytes_freed   = 2;
 }
 
 message SnapshotRequest {
