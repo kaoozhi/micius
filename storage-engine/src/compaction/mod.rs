@@ -1,3 +1,4 @@
+use crate::chunk::writer::ChunkWriteResult;
 use crate::chunk::{reader::ChunkReader, writer::ChunkWriter};
 use crate::index::chunk_index::ChunkIndex;
 use crate::types::*;
@@ -12,6 +13,11 @@ pub struct CompactionWorker {
     writer: Arc<ChunkWriter>,
     min_threshold: usize, // minimum chunk files per tier to trigger a merge
     size_ratio: f64,      // max/min file size ratio within a merge group
+}
+
+pub struct CompactionResult {
+    pub chunks_merged: u32,
+    pub bytes_freed: u64,
 }
 
 #[derive(Default)]
@@ -93,7 +99,7 @@ impl CompactionWorker {
             .collect()
     }
 
-    async fn merge_group(&self, group: MergeGroup) -> Result<()> {
+    async fn merge_group(&self, group: &MergeGroup) -> Result<ChunkWriteResult> {
         let mut entries: BTreeMap<SeriesKey, Vec<(i64, f64)>> = BTreeMap::new();
         for (_, path) in group.chunks.iter() {
             let points = ChunkReader::read_chunk(path).await?;
@@ -124,8 +130,8 @@ impl CompactionWorker {
             );
         }
 
-        for (series_id, chunk_id, time_start_ns) in group.deregister {
-            index.deregister(series_id, chunk_id, time_start_ns);
+        for (series_id, chunk_id, time_start_ns) in group.deregister.iter() {
+            index.deregister(*series_id, *chunk_id, *time_start_ns);
         }
 
         drop(index);
@@ -138,18 +144,35 @@ impl CompactionWorker {
             }
         }
 
-        Ok(())
+        Ok(result)
     }
 
-    pub async fn compact_once(&self) -> Result<()> {
+    pub async fn compact_once(&self) -> Result<CompactionResult> {
+        let mut old_bytes: u64 = 0;
         let candidates = {
             let index = self.index.read().await;
-            self.find_candidates(&index)
+            let candidates = self.find_candidates(&index);
+            // Accumulate old file sizes under the same read lock used for candidate
+            // selection. This is safe because find_candidates guarantees no chunk
+            // appears in more than one group (files are assigned linearly to exactly
+            // one group). If that invariant were relaxed, old_bytes would silently
+            // double-count files that appear in multiple groups.
+            for group in candidates.iter() {
+                old_bytes += group
+                    .chunks
+                    .iter()
+                    .filter_map(|(id, _)| index.chunk_files.get(id).map(|c| c.file_size))
+                    .sum::<u64>();
+            }
+            candidates
         };
 
         if candidates.is_empty() {
             tracing::debug!("No compaction candidates found");
-            return Ok(());
+            return Ok(CompactionResult {
+                chunks_merged: 0,
+                bytes_freed: 0,
+            });
         }
 
         tracing::info!(
@@ -157,10 +180,17 @@ impl CompactionWorker {
             "Compaction: merging chunk groups"
         );
 
-        for group in candidates {
-            self.merge_group(group).await?;
+        let mut new_bytes: u64 = 0;
+        let mut chunks_merged: usize = 0;
+        for group in candidates.iter() {
+            let result = self.merge_group(group).await?;
+            new_bytes += result.chunk_meta.file_size;
+            chunks_merged += group.chunks.len();
         }
 
-        Ok(())
+        Ok(CompactionResult {
+            chunks_merged: chunks_merged as u32,
+            bytes_freed: old_bytes.saturating_sub(new_bytes),
+        })
     }
 }
