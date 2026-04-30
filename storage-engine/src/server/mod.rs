@@ -113,12 +113,6 @@ impl StorageService for StorageServer {
         Ok(Response::new(AppendResponse { sequence: seq }))
     }
 
-    async fn compact(
-        &self,
-        request: Request<CompactRequest>,
-    ) -> Result<Response<CompactResponse>, Status> {
-        todo!()
-    }
     type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
     async fn query(
         &self,
@@ -254,7 +248,12 @@ impl StorageService for StorageServer {
 
         Ok(Response::new(Self::QueryStream::new(rx)))
     }
-
+    async fn compact(
+        &self,
+        request: Request<CompactRequest>,
+    ) -> Result<Response<CompactResponse>, Status> {
+        todo!()
+    }
     async fn snapshot(
         &self,
         request: Request<SnapshotRequest>,

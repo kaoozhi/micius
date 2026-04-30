@@ -6,14 +6,12 @@ use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tokio::time::{Duration, interval};
 
 pub struct CompactionWorker {
     index: Arc<RwLock<ChunkIndex>>,
     writer: Arc<ChunkWriter>,
-    interval_secs: u64,
-    min_threshold: usize, // minimum chunks per series to trigger
-    size_ratio: f64,      // max/min size ratio within a merge group
+    min_threshold: usize, // minimum chunk files per tier to trigger a merge
+    size_ratio: f64,      // max/min file size ratio within a merge group
 }
 
 #[derive(Default)]
@@ -26,28 +24,15 @@ impl CompactionWorker {
     pub fn new(
         index: Arc<RwLock<ChunkIndex>>,
         writer: Arc<ChunkWriter>,
-        interval_secs: u64,
         min_threshold: usize,
         size_ratio: f64,
     ) -> Self {
-        assert!(interval_secs >= 1, "interval_secs must be >= 1");
         assert!(size_ratio >= 1.0, "size_ratio must be >= 1.0");
         Self {
             index,
             writer,
-            interval_secs,
             min_threshold,
             size_ratio,
-        }
-    }
-
-    pub async fn run(&self) {
-        let mut ticker = interval(Duration::from_secs(self.interval_secs));
-        loop {
-            ticker.tick().await;
-            if let Err(e) = self.compact_once().await {
-                tracing::error!(error = %e, "compaction cycle failed");
-            }
         }
     }
 

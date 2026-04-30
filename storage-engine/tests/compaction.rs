@@ -75,7 +75,7 @@ mod tests {
         );
 
         // Compact — min_threshold=2, size_ratio=10.0 (all 3 files merge)
-        let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 2, 10.0);
+        let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 2, 10.0);
         worker.compact_once().await.expect("compaction failed");
 
         // Fewer chunks in the index after compaction
@@ -142,7 +142,7 @@ async fn test_old_chunk_files_deleted_after_compaction() {
         );
     }
 
-    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 2, 10.0);
+    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 2, 10.0);
     worker.compact_once().await.expect("compaction failed");
 
     for path in &old_paths {
@@ -187,7 +187,7 @@ async fn test_old_chunk_ids_removed_from_index() {
         }
     }
 
-    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 2, 10.0);
+    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 2, 10.0);
     worker.compact_once().await.expect("compaction failed");
 
     let idx = index.read().await;
@@ -227,7 +227,7 @@ async fn test_no_compaction_when_below_threshold() {
     }
 
     // min_threshold=3 but only 2 chunks — no merge should happen
-    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 3, 10.0);
+    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 3, 10.0);
     worker.compact_once().await.expect("compact_once failed");
 
     assert_eq!(
@@ -249,7 +249,7 @@ async fn test_compact_once_empty_index_is_noop() {
     let writer = Arc::new(ChunkWriter::new(dir.path()));
     let index = Arc::new(RwLock::new(ChunkIndex::new()));
 
-    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 2, 2.0);
+    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 2, 2.0);
     worker
         .compact_once()
         .await
@@ -278,7 +278,7 @@ async fn test_no_compaction_when_sizes_exceed_ratio() {
     .await;
 
     // size_ratio=1.1 — only files within 10% of each other merge
-    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 2, 1.1);
+    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 2, 1.1);
     worker.compact_once().await.expect("compact_once failed");
 
     assert_eq!(
@@ -311,7 +311,7 @@ async fn test_merged_data_is_sorted_and_complete() {
     )
     .await;
 
-    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 1, 2, 10.0);
+    let worker = CompactionWorker::new(Arc::clone(&index), Arc::clone(&writer), 2, 10.0);
     worker.compact_once().await.expect("compaction failed");
 
     let series_id = SeriesId::from(&key);
