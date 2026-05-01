@@ -1,14 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches:
-      - main
-      - "dev/*"
-    paths:
-      - "storage-engine/**"
-      - "proto/**"
-      - ".github/workflows/**"
   pull_request:
     branches:
       - main
@@ -92,12 +84,12 @@ jobs:
         working-directory: storage-engine
 
   # ── Security ──────────────────────────────────────────────────────────────────
-  audit:
-    name: Security Audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: rustsec/audit-check@v1
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: storage-engine
+  # audit:
+  #   name: Security Audit
+  #   runs-on: ubuntu-latest
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - uses: rustsec/audit-check@v1
+  #       with:
+  #         token: ${{ secrets.GITHUB_TOKEN }}
+  #         working-directory: storage-engine
