@@ -1,0 +1,29 @@
+services:
+  storage-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: micius-storage-engine:latest
+    container_name: micius-storage-engine
+    ports:
+      - "50051:50051"   # gRPC
+      - "9091:9091"     # Prometheus metrics
+    volumes:
+      - storage-data:/var/micius/data
+    env_file:
+      - .env
+    environment:
+      # Override defaults from Dockerfile ENV — .env takes precedence over these
+      RUST_LOG: storage_engine=info
+    restart: unless-stopped
+    healthcheck:
+      # grpc_health_probe not yet available — use a TCP check on the gRPC port
+      test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/50051'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  storage-data:
+    driver: local
