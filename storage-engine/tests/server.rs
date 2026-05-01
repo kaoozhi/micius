@@ -16,8 +16,21 @@ use tonic::Request;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+/// Initialize the tracing subscriber once for the entire test binary.
+/// Safe to call from multiple concurrent tests — `OnceLock` guarantees
+/// the subscriber is registered exactly once regardless of call order.
+fn init_tracing() {
+    static TRACING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    TRACING.get_or_init(|| {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init();
+    });
+}
+
 /// Build a `StorageConfig` pointing entirely inside `dir` — safe for parallel tests.
 fn test_config(dir: &TempDir) -> StorageConfig {
+    init_tracing();
     StorageConfig {
         wal_dir: dir.path().join("wal"),
         chunk_dir: dir.path().join("chunks"),

@@ -103,7 +103,7 @@ impl WalWriter {
         Ok(self.current_seq)
     }
 
-    async fn rotate(&mut self) -> Result<()> {
+    pub async fn rotate(&mut self) -> Result<()> {
         self.completed_segments
             .push((self.current_segment, self.current_seq));
         self.current_segment += 1;

@@ -20,12 +20,12 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub struct StorageServer {
-    pub wal:               Arc<Mutex<WalWriter>>,
-    pub memtable:          Arc<Mutex<Memtable>>,
-    pub index:             Arc<RwLock<ChunkIndex>>,
-    pub chunk_writer:      Arc<ChunkWriter>,
+    pub wal: Arc<Mutex<WalWriter>>,
+    pub memtable: Arc<Mutex<Memtable>>,
+    pub index: Arc<RwLock<ChunkIndex>>,
+    pub chunk_writer: Arc<ChunkWriter>,
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
-    pub snapshot_path:     PathBuf,
+    pub snapshot_path: PathBuf,
 }
 
 impl StorageServer {
@@ -43,11 +43,10 @@ impl StorageServer {
     pub async fn open(config: &StorageConfig) -> anyhow::Result<Self> {
         // 1. Index snapshot ─────────────────────────────────────────────────
         // None = first run or missing snapshot → start from empty index.
-        let (mut idx, last_seq) =
-            match index::persistence::load_index(&config.index_path).await? {
-                None => (ChunkIndex::new(), 0),
-                Some((idx, seq)) => (idx, seq),
-            };
+        let (mut idx, last_seq) = match index::persistence::load_index(&config.index_path).await? {
+            None => (ChunkIndex::new(), 0),
+            Some((idx, seq)) => (idx, seq),
+        };
         tracing::info!(
             series = idx.series_count(),
             chunks = idx.chunk_file_count(),
@@ -60,7 +59,7 @@ impl StorageServer {
         // Returns only the points not yet flushed to chunk files.
         let recovery = wal::recovery::recover(&config.wal_dir).await?;
         tracing::info!(
-            points   = recovery.points.len(),
+            points = recovery.points.len(),
             segments = recovery.segments_replayed,
             last_seq = recovery.last_sequence,
             "WAL recovered"
@@ -94,6 +93,9 @@ impl StorageServer {
         )
         .await?;
 
+        if recovery.segments_replayed > 0 {
+            wal_writer.rotate().await?;
+        }
         let to_delete = wal_writer.drain_completed_before(u64::MAX);
         for path in &to_delete {
             if let Err(e) = tokio::fs::remove_file(path).await {
@@ -103,9 +105,9 @@ impl StorageServer {
         tracing::info!(deleted = to_delete.len(), "WAL segments cleaned up");
 
         // 5. Wrap in Arc ────────────────────────────────────────────────────
-        let wal    = Arc::new(Mutex::new(wal_writer));
-        let mem    = Arc::new(Mutex::new(memtable));
-        let index  = Arc::new(RwLock::new(idx));
+        let wal = Arc::new(Mutex::new(wal_writer));
+        let mem = Arc::new(Mutex::new(memtable));
+        let index = Arc::new(RwLock::new(idx));
         let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));
 
         let compaction_worker = Arc::new(Mutex::new(CompactionWorker::new(
@@ -117,11 +119,11 @@ impl StorageServer {
 
         Ok(Self {
             wal,
-            memtable:          mem,
+            memtable: mem,
             index,
-            chunk_writer:      writer,
+            chunk_writer: writer,
             compaction_worker,
-            snapshot_path:     config.index_path.clone(),
+            snapshot_path: config.index_path.clone(),
         })
     }
 }
