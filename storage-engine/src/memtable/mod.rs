@@ -103,7 +103,7 @@ impl Memtable {
         time_map
             .iter()
             .filter(|(ts, _)| time_start_ns <= *ts && time_end_ns >= *ts)
-            .filter(|(_, val)| predicate.map_or(true, |p| p.satisfies(*val)))
+            .filter(|(_, val)| predicate.is_none_or(|p| p.satisfies(*val)))
             .map(|(ts, val)| DataPoint {
                 metric_name: series_key.metric_name.clone(),
                 tags: series_key.tags.clone(),

@@ -105,7 +105,7 @@ impl ChunkIndex {
             .filter(|id| {
                 self.series_registry
                     .get(id)
-                    .map_or(false, |sk| sk.metric_name == metric)
+                    .is_some_and(|sk| sk.metric_name == metric)
             })
             .collect();
 

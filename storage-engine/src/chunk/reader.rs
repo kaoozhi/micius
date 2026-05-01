@@ -267,7 +267,7 @@ fn retrieve_data(
 
     let points: Vec<DataPoint> = ts_decoded
         .into_iter()
-        .zip(val_decoded.into_iter())
+        .zip(val_decoded)
         .filter(|(ts, _)| {
             *ts >= time_start_ns.unwrap_or(i64::MIN) && *ts <= time_end_ns.unwrap_or(i64::MAX)
         })

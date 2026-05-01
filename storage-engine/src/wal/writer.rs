@@ -155,13 +155,13 @@ async fn highest_segment_number(wal_dir: &Path) -> Result<Option<u64>> {
     while let Some(entry) = dir.next_entry().await? {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if name.ends_with(".wal") {
-            if let Ok(n) = name.trim_end_matches(".wal").parse::<u64>() {
-                match max {
-                    None => max = Some(n),
-                    Some(m) if n > m => max = Some(n),
-                    _ => {}
-                }
+        if name.ends_with(".wal")
+            && let Ok(n) = name.trim_end_matches(".wal").parse::<u64>()
+        {
+            match max {
+                None => max = Some(n),
+                Some(m) if n > m => max = Some(n),
+                _ => {}
             }
         }
     }

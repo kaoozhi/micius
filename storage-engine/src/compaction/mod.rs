@@ -137,10 +137,10 @@ impl CompactionWorker {
         drop(index);
 
         for (_, path) in &group.chunks {
-            if let Err(e) = tokio::fs::remove_file(path).await {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = ?path, error = %e, "failed to delete old chunk file");
-                }
+            if let Err(e) = tokio::fs::remove_file(path).await
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = ?path, error = %e, "failed to delete old chunk file");
             }
         }
 

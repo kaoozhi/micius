@@ -116,6 +116,5 @@ fn rebuild_index(snapshot: IndexSnapshot) -> ChunkIndex {
             .iter()
             .map(|(cid, meta)| (*cid, meta.clone()))
             .collect(),
-        ..ChunkIndex::default()
     }
 }
