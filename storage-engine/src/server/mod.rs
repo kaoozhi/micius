@@ -159,6 +159,8 @@ impl StorageService for StorageServer {
                 .map_err(|e| Status::internal(format!("WAL error: {}", e)))?
         }; // WAL lock released here
 
+        tracing::info!(points = points.len(), seq = seq, "append");
+
         // ── Step 3: Memtable insert ───────────────────────────────────────────
         let mut mem = self.memtable.lock().await;
         for point in points {
@@ -171,6 +173,7 @@ impl StorageService for StorageServer {
         if mem.should_flush() {
             let drained = mem.drain();
             drop(mem); // release memtable lock before spawning
+            tracing::debug!(series = drained.len(), seq, "flush triggered");
 
             let chunk_writer = Arc::clone(&self.chunk_writer);
             let index = Arc::clone(&self.index);
@@ -189,6 +192,11 @@ impl StorageService for StorageServer {
                                 result.chunk_meta.clone(),
                             );
                         }
+                        tracing::info!(
+                            series  = result.series_results.len(),
+                            chunk   = ?result.chunk_meta.file_path,
+                            "memtable flushed"
+                        );
                         drop(index); // release index lock before acquiring WAL lock
 
                         // Delete completed WAL segments whose max_seq ≤ seq.
@@ -196,15 +204,20 @@ impl StorageService for StorageServer {
                         // covered by the flushed memtable are eligible.
                         let paths = {
                             let mut wal = wal.lock().await;
-                            wal.drain_completed_before(seq)
+                            if let Err(e) = wal.rotate().await {
+                                tracing::error!(error = %e, "WAL rotation after flush failed");
+                            }
+                            wal.drain_completed_before(u64::MAX)
                         }; // WAL lock released before file I/O
 
+                        let deleted = paths.len();
                         for path in paths {
                             if let Err(e) = tokio::fs::remove_file(&path).await {
                                 // NotFound is benign — cleaned up by a previous run.
                                 tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
                             }
                         }
+                        tracing::info!(deleted, seq, "WAL segments cleaned up");
                     }
                     Err(e) => tracing::error!(error = %e, "flush failed"),
                 }
@@ -236,6 +249,14 @@ impl StorageService for StorageServer {
             time_end_ns: req.time_end_ns.unwrap_or(i64::MAX),
         };
 
+        let tags_display = query
+            .tags
+            .iter()
+            .map(|(k, v)| format!("{k}:{v}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        tracing::info!(metric = %query.metric_name, tags = %tags_display, "query");
+
         // Spawn the query execution task. The RPC returns immediately with the
         // stream handle; results are sent incrementally as they are read.
         let (tx, rx) = tokio::sync::mpsc::channel(256);
@@ -265,22 +286,27 @@ impl StorageService for StorageServer {
                 responses
             }; // memtable lock released here
 
+            tracing::debug!(points = mem_response.len(), "memtable scan complete");
+
+            let mut streamed: usize = 0;
             for response in mem_response {
                 if tx.send(Ok(response)).await.is_err() {
                     return; // client disconnected — stop streaming
                 }
+                streamed += 1;
             }
 
             // ── Stage 2: Chunk index scan ─────────────────────────────────────
             // Collect chunk metadata under the index read lock, then release it
             // before any disk I/O — the lock must not be held across async file
             // reads, which would block concurrent flush writes to the index.
-            let (chunks, paths, keys) = {
+            let (chunks, paths, keys, series_count) = {
                 let idx = index.read().await;
 
                 // resolve_series → prune_chunks: two in-memory stages, no I/O.
                 // predicate: None — value filter not in proto for Phase 1.
                 let series_ids = idx.resolve_series(&query.metric_name, &query.tags);
+                let series_count: usize = series_ids.len();
                 let chunks: Vec<SeriesChunkEntry> = series_ids
                     .iter()
                     .flat_map(|id| {
@@ -306,8 +332,10 @@ impl StorageService for StorageServer {
                     })
                     .collect();
 
-                (chunks, paths, keys)
+                (chunks, paths, keys, series_count)
             }; // index read lock released here — all disk I/O below is lock-free
+
+            tracing::debug!(series = series_count, chunks = chunks.len(), "index pruned");
 
             // ── Stage 3: Chunk reads ──────────────────────────────────────────
             // For each surviving chunk entry: full decompression. Stream each point as it is decoded.
@@ -341,12 +369,14 @@ impl StorageService for StorageServer {
                             if tx.send(Ok(response)).await.is_err() {
                                 return; // client disconnected
                             }
+                            streamed += 1;
                         }
                     }
                     Ok(None) => continue, // series absent or no points in range
                     Err(e) => tracing::warn!(error = %e, "series read failed"),
                 }
             }
+            tracing::debug!(points = streamed, "query complete");
         });
 
         Ok(Response::new(Self::QueryStream::new(rx)))
@@ -355,6 +385,7 @@ impl StorageService for StorageServer {
         &self,
         _request: Request<CompactRequest>,
     ) -> Result<Response<CompactResponse>, Status> {
+        tracing::info!("compact");
         let result = self
             .compaction_worker
             .lock()
@@ -363,16 +394,22 @@ impl StorageService for StorageServer {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        tracing::info!(
+            chunks_merged = result.chunks_merged,
+            bytes_freed = result.bytes_freed,
+            "compaction complete"
+        );
         Ok(Response::new(CompactResponse {
             chunks_merged: result.chunks_merged,
             bytes_freed: result.bytes_freed,
         }))
     }
+
     async fn snapshot(
         &self,
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
-        // todo!()
+        tracing::info!("snapshot");
         let seq = self.wal.lock().await.current_sequence();
         let index = self.index.read().await;
 
@@ -380,6 +417,7 @@ impl StorageService for StorageServer {
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
+        tracing::info!(seq, path = %self.snapshot_path.display(), "snapshot saved");
         Ok(Response::new(SnapshotResponse {
             snapshot_path: self.snapshot_path.to_string_lossy().into_owned(),
         }))

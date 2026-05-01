@@ -11,6 +11,7 @@ use storage_engine::proto::storage::v1::{
 };
 use storage_engine::server::StorageServer;
 use tempfile::{TempDir, tempdir};
+use tokio::time::Duration;
 use tokio_stream::StreamExt;
 use tonic::Request;
 
@@ -229,17 +230,17 @@ async fn test_concurrent_appends_are_serialised() {
 /// when there are no matches.
 #[tokio::test]
 async fn test_query_nonexistent_metric_returns_empty() {
-    let dir    = tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let config = test_config(&dir);
     config.ensure_dirs().await.unwrap();
     let server = StorageServer::open(&config).await.expect("open failed");
 
     let mut stream = server
         .query(Request::new(QueryRequest {
-            metric_name:  "does.not.exist".to_string(),
-            tag_filters:  HashMap::new(),
+            metric_name: "does.not.exist".to_string(),
+            tag_filters: HashMap::new(),
             time_start_ns: None,
-            time_end_ns:   None,
+            time_end_ns: None,
         }))
         .await
         .expect("query must not error on missing metric")
@@ -256,7 +257,7 @@ async fn test_query_nonexistent_metric_returns_empty() {
 /// are returned.
 #[tokio::test]
 async fn test_time_range_filter() {
-    let dir    = tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let config = test_config(&dir);
     config.ensure_dirs().await.unwrap();
     let server = StorageServer::open(&config).await.expect("open failed");
@@ -274,10 +275,10 @@ async fn test_time_range_filter() {
     // Query only [2s, 4s] — should return 3 points (2s, 3s, 4s)
     let mut stream = server
         .query(Request::new(QueryRequest {
-            metric_name:   "cpu.load".to_string(),
-            tag_filters:   HashMap::from([("host".to_string(), "web1".to_string())]),
+            metric_name: "cpu.load".to_string(),
+            tag_filters: HashMap::from([("host".to_string(), "web1".to_string())]),
             time_start_ns: Some(2 * 1_000_000_000),
-            time_end_ns:   Some(4 * 1_000_000_000),
+            time_end_ns: Some(4 * 1_000_000_000),
         }))
         .await
         .expect("query failed")
@@ -288,11 +289,27 @@ async fn test_time_range_filter() {
         timestamps.push(resp.expect("stream error").timestamp_ns);
     }
 
-    assert_eq!(timestamps.len(), 3, "only points within [2s, 4s] must return");
-    assert!(timestamps.contains(&(2 * 1_000_000_000)), "2s must be included");
-    assert!(timestamps.contains(&(4 * 1_000_000_000)), "4s must be included");
-    assert!(!timestamps.contains(&(1 * 1_000_000_000)), "1s must be excluded");
-    assert!(!timestamps.contains(&(5 * 1_000_000_000)), "5s must be excluded");
+    assert_eq!(
+        timestamps.len(),
+        3,
+        "only points within [2s, 4s] must return"
+    );
+    assert!(
+        timestamps.contains(&(2 * 1_000_000_000)),
+        "2s must be included"
+    );
+    assert!(
+        timestamps.contains(&(4 * 1_000_000_000)),
+        "4s must be included"
+    );
+    assert!(
+        !timestamps.contains(&(1 * 1_000_000_000)),
+        "1s must be excluded"
+    );
+    assert!(
+        !timestamps.contains(&(5 * 1_000_000_000)),
+        "5s must be excluded"
+    );
 }
 
 /// Writes enough data to exceed the (small) memtable threshold and trigger a
@@ -326,10 +343,10 @@ async fn test_data_queryable_after_flush() {
     // All 20 points must be queryable — served from the chunk file
     let mut stream = server
         .query(Request::new(QueryRequest {
-            metric_name:   "cpu.load".to_string(),
-            tag_filters:   HashMap::from([("host".to_string(), "web1".to_string())]),
+            metric_name: "cpu.load".to_string(),
+            tag_filters: HashMap::from([("host".to_string(), "web1".to_string())]),
             time_start_ns: None,
-            time_end_ns:   None,
+            time_end_ns: None,
         }))
         .await
         .expect("query failed")
@@ -352,7 +369,7 @@ async fn test_data_queryable_after_flush() {
 /// Verifies the WAL monotonicity guarantee — critical for ordering and recovery.
 #[tokio::test]
 async fn test_sequence_numbers_are_monotonically_increasing() {
-    let dir    = tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let config = test_config(&dir);
     config.ensure_dirs().await.unwrap();
     let server = StorageServer::open(&config).await.expect("open failed");
@@ -361,14 +378,22 @@ async fn test_sequence_numbers_are_monotonically_increasing() {
     for i in 0..5u64 {
         let seq = server
             .append(Request::new(AppendRequest {
-                points: vec![data_point("cpu.load", "web1", i as i64 * 1_000_000_000, i as f64)],
+                points: vec![data_point(
+                    "cpu.load",
+                    "web1",
+                    i as i64 * 1_000_000_000,
+                    i as f64,
+                )],
             }))
             .await
             .expect("append failed")
             .into_inner()
             .sequence;
 
-        assert!(seq > prev_seq, "sequence {seq} must be > previous {prev_seq}");
+        assert!(
+            seq > prev_seq,
+            "sequence {seq} must be > previous {prev_seq}"
+        );
         prev_seq = seq;
     }
 }
@@ -378,7 +403,7 @@ async fn test_sequence_numbers_are_monotonically_increasing() {
 /// series.
 #[tokio::test]
 async fn test_tag_filter_isolates_series() {
-    let dir    = tempdir().unwrap();
+    let dir = tempdir().unwrap();
     let config = test_config(&dir);
     config.ensure_dirs().await.unwrap();
     let server = StorageServer::open(&config).await.expect("open failed");
@@ -399,10 +424,10 @@ async fn test_tag_filter_isolates_series() {
     // Query only web1 — must return exactly 2 points
     let mut stream = server
         .query(Request::new(QueryRequest {
-            metric_name:   "cpu.load".to_string(),
-            tag_filters:   HashMap::from([("host".to_string(), "web1".to_string())]),
+            metric_name: "cpu.load".to_string(),
+            tag_filters: HashMap::from([("host".to_string(), "web1".to_string())]),
             time_start_ns: None,
-            time_end_ns:   None,
+            time_end_ns: None,
         }))
         .await
         .expect("query failed")
@@ -413,7 +438,10 @@ async fn test_tag_filter_isolates_series() {
         resp.expect("stream error");
         count += 1;
     }
-    assert_eq!(count, 2, "tag filter must return only web1 points, not web2");
+    assert_eq!(
+        count, 2,
+        "tag filter must return only web1 points, not web2"
+    );
 }
 
 /// Concurrent reads and writes — the most critical concurrency scenario for a
@@ -459,6 +487,7 @@ async fn test_concurrent_reads_and_writes() {
                 }))
                 .await
                 .expect("append must not fail under concurrent reads");
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
             "writer done"
         });
@@ -472,10 +501,10 @@ async fn test_concurrent_reads_and_writes() {
             for _ in 0..10 {
                 let mut stream = srv
                     .query(Request::new(QueryRequest {
-                        metric_name:   "cpu.load".to_string(),
-                        tag_filters:   HashMap::new(),
+                        metric_name: "cpu.load".to_string(),
+                        tag_filters: HashMap::new(),
                         time_start_ns: None,
-                        time_end_ns:   None,
+                        time_end_ns: None,
                     }))
                     .await
                     .expect("query must not error during concurrent writes")
@@ -506,10 +535,10 @@ async fn test_concurrent_reads_and_writes() {
     // Final consistency check — all written points must be visible
     let mut stream = server
         .query(Request::new(QueryRequest {
-            metric_name:   "cpu.load".to_string(),
-            tag_filters:   HashMap::new(),
+            metric_name: "cpu.load".to_string(),
+            tag_filters: HashMap::new(),
             time_start_ns: None,
-            time_end_ns:   None,
+            time_end_ns: None,
         }))
         .await
         .expect("final query failed")
