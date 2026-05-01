@@ -109,7 +109,9 @@ async fn test_resume_seq_continuous_across_restart() {
         .await
         .expect("failed to open WAL");
     for _ in 0..3 {
-        wal.append(&sample_points(1)).await.expect("failed to append");
+        wal.append(&sample_points(1))
+            .await
+            .expect("failed to append");
     }
     assert_eq!(wal.current_sequence(), 3);
     drop(wal);
@@ -124,8 +126,14 @@ async fn test_resume_seq_continuous_across_restart() {
         .expect("failed to reopen WAL");
 
     // First append after restart must produce 4, not 1
-    let seq = wal.append(&sample_points(1)).await.expect("failed to append");
-    assert_eq!(seq, 4, "sequence must continue from last_sequence + 1 across restarts");
+    let seq = wal
+        .append(&sample_points(1))
+        .await
+        .expect("failed to append");
+    assert_eq!(
+        seq, 4,
+        "sequence must continue from last_sequence + 1 across restarts"
+    );
 }
 
 #[tokio::test]
@@ -135,10 +143,18 @@ async fn test_drain_completed_before_no_rotation() {
     let mut wal = WalWriter::open(test_dir.path(), 1024 * 1024, 0)
         .await
         .expect("failed to open WAL");
-    wal.append(&sample_points(1)).await.expect("failed to append");
+    wal.append(&sample_points(1))
+        .await
+        .expect("failed to append");
 
-    assert!(wal.drain_completed_before(0).is_empty(),       "no completed segments → empty even at seq 0");
-    assert!(wal.drain_completed_before(u64::MAX).is_empty(), "no completed segments → empty even at u64::MAX");
+    assert!(
+        wal.drain_completed_before(0).is_empty(),
+        "no completed segments → empty even at seq 0"
+    );
+    assert!(
+        wal.drain_completed_before(u64::MAX).is_empty(),
+        "no completed segments → empty even at u64::MAX"
+    );
 }
 
 #[tokio::test]
@@ -151,7 +167,10 @@ async fn test_drain_completed_before_basic() {
     // Write until 2 rotations have occurred (3 segment files on disk)
     let mut last_seq = 0u64;
     loop {
-        last_seq = wal.append(&sample_points(5)).await.expect("failed to append");
+        last_seq = wal
+            .append(&sample_points(5))
+            .await
+            .expect("failed to append");
         if count_wal_files(test_dir.path()) >= 3 {
             break;
         }
@@ -159,13 +178,24 @@ async fn test_drain_completed_before_basic() {
 
     // All completed segments should be returned
     let paths = wal.drain_completed_before(u64::MAX);
-    assert_eq!(paths.len(), 2, "expected 2 completed segments after 2 rotations");
+    assert_eq!(
+        paths.len(),
+        2,
+        "expected 2 completed segments after 2 rotations"
+    );
     for path in &paths {
-        assert!(path.exists(), "returned path must exist on disk: {:?}", path);
+        assert!(
+            path.exists(),
+            "returned path must exist on disk: {:?}",
+            path
+        );
     }
 
     // Second call is idempotent — list was drained
-    assert!(wal.drain_completed_before(u64::MAX).is_empty(), "drain must be idempotent");
+    assert!(
+        wal.drain_completed_before(u64::MAX).is_empty(),
+        "drain must be idempotent"
+    );
 }
 
 #[tokio::test]
@@ -182,7 +212,10 @@ async fn test_drain_completed_before_boundary() {
     let mut rotation_seq: Option<u64> = None;
     loop {
         let before = count_wal_files(test_dir.path());
-        let seq = wal.append(&sample_points(5)).await.expect("failed to append");
+        let seq = wal
+            .append(&sample_points(5))
+            .await
+            .expect("failed to append");
         let after = count_wal_files(test_dir.path());
         if after > before {
             rotation_seq = Some(seq); // this seq is the max_seq of the completed segment
@@ -193,11 +226,19 @@ async fn test_drain_completed_before_boundary() {
 
     // One below the boundary — segment must NOT be returned
     let below = wal.drain_completed_before(max_seq - 1);
-    assert!(below.is_empty(), "segment with max_seq={max_seq} must not be returned at flushed_seq={}", max_seq - 1);
+    assert!(
+        below.is_empty(),
+        "segment with max_seq={max_seq} must not be returned at flushed_seq={}",
+        max_seq - 1
+    );
 
     // Exactly at the boundary — segment MUST be returned
     let at = wal.drain_completed_before(max_seq);
-    assert_eq!(at.len(), 1, "segment with max_seq={max_seq} must be returned at flushed_seq={max_seq}");
+    assert_eq!(
+        at.len(),
+        1,
+        "segment with max_seq={max_seq} must be returned at flushed_seq={max_seq}"
+    );
 }
 
 // ---------------------------------------------------------------------------

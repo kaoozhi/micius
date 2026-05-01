@@ -76,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
     // then the index read lock is acquired for serialisation. Two locks are never
     // held simultaneously, avoiding contention with the flush write path.
     {
-        let idx_clone  = Arc::clone(&server.index);
-        let wal_clone  = Arc::clone(&server.wal);
+        let idx_clone = Arc::clone(&server.index);
+        let wal_clone = Arc::clone(&server.wal);
         let index_path = server.snapshot_path.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
@@ -107,7 +107,9 @@ async fn main() -> anyhow::Result<()> {
     });
     Server::builder()
         .add_service(StorageServiceServer::new(server))
-        .serve_with_shutdown(grpc_addr, async { shutdown_rx.await.ok(); })
+        .serve_with_shutdown(grpc_addr, async {
+            shutdown_rx.await.ok();
+        })
         .await?;
 
     Ok(())
