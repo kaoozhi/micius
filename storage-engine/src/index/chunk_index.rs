@@ -113,10 +113,7 @@ impl ChunkIndex {
             return vec![];
         }
 
-        loop {
-            let Some((tag_key, tag_val)) = filters_iter.next() else {
-                break;
-            };
+        for (tag_key, tag_val) in filters_iter {
             match self.tag_index.get(&(tag_key.clone(), tag_val.clone())) {
                 None => return vec![],
                 Some(set) => {
@@ -127,6 +124,7 @@ impl ChunkIndex {
                 }
             }
         }
+
         candidate_ids
             .into_iter()
             .filter(|id| {
