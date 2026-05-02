@@ -34,6 +34,7 @@ bloomfilter    = "1"
 tracing              = "0.1"
 tracing-subscriber   = { version = "0.3", features = ["env-filter"] }
 prometheus           = { version = "0.13", features = ["process"] }
+axum                 = "0.7"
 
 # Utilities
 uuid           = { version = "1", features = ["v4"] }

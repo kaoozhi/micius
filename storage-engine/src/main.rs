@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use storage_engine::config::StorageConfig;
 use storage_engine::index;
+use storage_engine::metrics;
 use storage_engine::proto::storage::v1::storage_service_server::StorageServiceServer;
 use storage_engine::server::StorageServer;
 use tokio::time::Duration;
@@ -93,6 +94,15 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // ── Prometheus metrics server ─────────────────────────────────────────────
+
+    let metrics_addr = config.metrics_addr.parse()?;
+    tokio::spawn(async move {
+        if let Err(e) = metrics::serve(metrics_addr).await {
+            tracing::error!(error = %e, "metrics server failed");
+        }
+    });
 
     // ── gRPC server ───────────────────────────────────────────────────────────
 

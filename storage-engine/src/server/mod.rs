@@ -6,6 +6,7 @@ use crate::{
     config::StorageConfig,
     index::{self, chunk_index::ChunkIndex},
     memtable::Memtable,
+    metrics,
     proto::storage::v1::{
         AppendRequest, AppendResponse, CompactRequest, CompactResponse, QueryRequest,
         QueryResponse, SnapshotRequest, SnapshotResponse, storage_service_server::StorageService,
@@ -152,12 +153,19 @@ impl StorageService for StorageServer {
         // ── Step 2: WAL append (must complete before memtable insert) ─────────
         // fsync happens inside append(). seq is the monotonic token returned
         // to the caller and used later to bound WAL segment deletion.
+        let wal_start = std::time::Instant::now();
         let seq = {
             let mut wal = self.wal.lock().await;
             wal.append(&points)
                 .await
-                .map_err(|e| Status::internal(format!("WAL error: {}", e)))?
+                .map_err(|e| {
+                    metrics::wal_entries_total().with_label_values(&["error"]).inc();
+                    Status::internal(format!("WAL error: {}", e))
+                })?
         }; // WAL lock released here
+        metrics::wal_append_duration().with_label_values(&["ok"])
+            .observe(wal_start.elapsed().as_secs_f64());
+        metrics::wal_entries_total().with_label_values(&["ok"]).inc();
 
         tracing::info!(points = points.len(), seq = seq, "append");
 
@@ -166,6 +174,7 @@ impl StorageService for StorageServer {
         for point in points {
             mem.insert(point);
         }
+        metrics::memtable_size_bytes().set(mem.size_bytes() as i64);
 
         // ── Step 4: Trigger async flush if threshold exceeded ─────────────────
         // Drain is atomic under the memtable lock. The flush itself runs in a
@@ -179,6 +188,7 @@ impl StorageService for StorageServer {
             let index = Arc::clone(&self.index);
             let wal = Arc::clone(&self.wal);
             tokio::spawn(async move {
+                let flush_start = std::time::Instant::now();
                 match chunk_writer.write(drained).await {
                     Ok(result) => {
                         // Register all series from the new chunk under a single
@@ -192,11 +202,18 @@ impl StorageService for StorageServer {
                                 result.chunk_meta.clone(),
                             );
                         }
+                        metrics::chunk_files_total().set(index.chunk_file_count() as i64);
+                        metrics::index_series_count().set(index.series_count() as i64);
                         tracing::info!(
                             series  = result.series_results.len(),
                             chunk   = ?result.chunk_meta.file_path,
                             "memtable flushed"
                         );
+                        metrics::chunk_bytes_written_total()
+                            .inc_by(result.chunk_meta.file_size);
+                        metrics::memtable_flush_duration_seconds()
+                            .observe(flush_start.elapsed().as_secs_f64());
+                        metrics::memtable_flush_total().with_label_values(&["ok"]).inc();
                         drop(index); // release index lock before acquiring WAL lock
 
                         // Delete completed WAL segments whose max_seq ≤ seq.
@@ -219,7 +236,10 @@ impl StorageService for StorageServer {
                         }
                         tracing::info!(deleted, seq, "WAL segments cleaned up");
                     }
-                    Err(e) => tracing::error!(error = %e, "flush failed"),
+                    Err(e) => {
+                        metrics::memtable_flush_total().with_label_values(&["error"]).inc();
+                        tracing::error!(error = %e, "flush failed");
+                    }
                 }
             });
         } else {
@@ -263,6 +283,7 @@ impl StorageService for StorageServer {
         let index = Arc::clone(&self.index);
         let memtable = Arc::clone(&self.memtable);
         tokio::spawn(async move {
+            let query_start = std::time::Instant::now();
             // ── Stage 1: Memtable scan ────────────────────────────────────────
             // Collect all matching points under the memtable lock, then release
             // it before streaming — the lock must not be held across channel
@@ -335,6 +356,12 @@ impl StorageService for StorageServer {
                 (chunks, paths, keys, series_count)
             }; // index read lock released here — all disk I/O below is lock-free
 
+            // Record pruning effectiveness: how many chunk entries existed vs survived.
+            metrics::query_chunks_scanned().with_label_values(&["total"])
+                .observe(series_count as f64);
+            metrics::query_chunks_scanned().with_label_values(&["after_pruning"])
+                .observe(chunks.len() as f64);
+
             tracing::debug!(series = series_count, chunks = chunks.len(), "index pruned");
 
             // ── Stage 3: Chunk reads ──────────────────────────────────────────
@@ -377,6 +404,7 @@ impl StorageService for StorageServer {
                 }
             }
             tracing::debug!(points = streamed, "query complete");
+            metrics::query_duration_seconds().observe(query_start.elapsed().as_secs_f64());
         });
 
         Ok(Response::new(Self::QueryStream::new(rx)))
@@ -392,11 +420,16 @@ impl StorageService for StorageServer {
             .await
             .compact_once()
             .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+            .map_err(|e| {
+                metrics::compaction_runs_total().with_label_values(&["error"]).inc();
+                Status::internal(e.to_string())
+            })?;
 
+        metrics::compaction_runs_total().with_label_values(&["ok"]).inc();
+        metrics::compaction_chunks_merged_total().inc_by(result.chunks_merged as u64);
         tracing::info!(
             chunks_merged = result.chunks_merged,
-            bytes_freed = result.bytes_freed,
+            bytes_freed   = result.bytes_freed,
             "compaction complete"
         );
         Ok(Response::new(CompactResponse {

@@ -1,6 +1,7 @@
 pub mod chunk;
 pub mod compaction;
 pub mod config;
+pub mod metrics;
 pub mod index;
 pub mod memtable;
 pub mod server;
