@@ -156,16 +156,19 @@ impl StorageService for StorageServer {
         let wal_start = std::time::Instant::now();
         let seq = {
             let mut wal = self.wal.lock().await;
-            wal.append(&points)
-                .await
-                .map_err(|e| {
-                    metrics::wal_entries_total().with_label_values(&["error"]).inc();
-                    Status::internal(format!("WAL error: {}", e))
-                })?
+            wal.append(&points).await.map_err(|e| {
+                metrics::wal_entries_total()
+                    .with_label_values(&["error"])
+                    .inc();
+                Status::internal(format!("WAL error: {}", e))
+            })?
         }; // WAL lock released here
-        metrics::wal_append_duration().with_label_values(&["ok"])
+        metrics::wal_append_duration()
+            .with_label_values(&["ok"])
             .observe(wal_start.elapsed().as_secs_f64());
-        metrics::wal_entries_total().with_label_values(&["ok"]).inc();
+        metrics::wal_entries_total()
+            .with_label_values(&["ok"])
+            .inc();
 
         tracing::info!(points = points.len(), seq = seq, "append");
 
@@ -209,11 +212,12 @@ impl StorageService for StorageServer {
                             chunk   = ?result.chunk_meta.file_path,
                             "memtable flushed"
                         );
-                        metrics::chunk_bytes_written_total()
-                            .inc_by(result.chunk_meta.file_size);
+                        metrics::chunk_bytes_written_total().inc_by(result.chunk_meta.file_size);
                         metrics::memtable_flush_duration_seconds()
                             .observe(flush_start.elapsed().as_secs_f64());
-                        metrics::memtable_flush_total().with_label_values(&["ok"]).inc();
+                        metrics::memtable_flush_total()
+                            .with_label_values(&["ok"])
+                            .inc();
                         drop(index); // release index lock before acquiring WAL lock
 
                         // Delete completed WAL segments whose max_seq ≤ seq.
@@ -237,7 +241,9 @@ impl StorageService for StorageServer {
                         tracing::info!(deleted, seq, "WAL segments cleaned up");
                     }
                     Err(e) => {
-                        metrics::memtable_flush_total().with_label_values(&["error"]).inc();
+                        metrics::memtable_flush_total()
+                            .with_label_values(&["error"])
+                            .inc();
                         tracing::error!(error = %e, "flush failed");
                     }
                 }
@@ -357,9 +363,11 @@ impl StorageService for StorageServer {
             }; // index read lock released here — all disk I/O below is lock-free
 
             // Record pruning effectiveness: how many chunk entries existed vs survived.
-            metrics::query_chunks_scanned().with_label_values(&["total"])
+            metrics::query_chunks_scanned()
+                .with_label_values(&["total"])
                 .observe(series_count as f64);
-            metrics::query_chunks_scanned().with_label_values(&["after_pruning"])
+            metrics::query_chunks_scanned()
+                .with_label_values(&["after_pruning"])
                 .observe(chunks.len() as f64);
 
             tracing::debug!(series = series_count, chunks = chunks.len(), "index pruned");
@@ -421,15 +429,19 @@ impl StorageService for StorageServer {
             .compact_once()
             .await
             .map_err(|e| {
-                metrics::compaction_runs_total().with_label_values(&["error"]).inc();
+                metrics::compaction_runs_total()
+                    .with_label_values(&["error"])
+                    .inc();
                 Status::internal(e.to_string())
             })?;
 
-        metrics::compaction_runs_total().with_label_values(&["ok"]).inc();
+        metrics::compaction_runs_total()
+            .with_label_values(&["ok"])
+            .inc();
         metrics::compaction_chunks_merged_total().inc_by(result.chunks_merged as u64);
         tracing::info!(
             chunks_merged = result.chunks_merged,
-            bytes_freed   = result.bytes_freed,
+            bytes_freed = result.bytes_freed,
             "compaction complete"
         );
         Ok(Response::new(CompactResponse {
