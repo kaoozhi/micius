@@ -1,10 +1,19 @@
 # ── Stage 1: builder ─────────────────────────────────────────────────────────
-FROM rust:1.91-bookworm AS builder
+# Alpine variant — same image used by zhejian-url, already cached locally.
+# Avoids pulling from docker.io through the corporate proxy.
+FROM rust:1.91-alpine AS builder
 
-# Install protoc — required by storage-engine/build.rs (tonic_build)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends protobuf-compiler && \
-    rm -rf /var/lib/apt/lists/*
+# Corporate proxy — passed at build time via docker-compose build.args.
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ENV HTTP_PROXY=$HTTP_PROXY
+ENV HTTPS_PROXY=$HTTPS_PROXY
+ENV NO_PROXY=$NO_PROXY
+
+# protoc — required by storage-engine/build.rs (tonic_build)
+# musl-dev — required for linking on Alpine
+RUN apk add --no-cache protobuf musl-dev
 
 WORKDIR /app
 
@@ -31,12 +40,11 @@ COPY storage-engine/src/ src/
 RUN touch src/main.rs && cargo build --release
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+# Alpine variant — cached locally, no apk calls needed in this stage.
+FROM alpine:3.19 AS runtime
 
-# ca-certificates — needed for any future TLS outbound connections
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Copy ca-certs from builder instead of running apk — avoids any network call.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
 # Copy the compiled binary from the builder stage
 COPY --from=builder /app/storage-engine/target/release/storage-engine \

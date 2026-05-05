@@ -3,6 +3,12 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        # Inherit proxy from host shell — no value = use host env var as-is.
+        # Credentials never written to image layers (Dockerfile uses ARG not ENV).
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1}
     image: micius-storage-engine:latest
     container_name: micius-storage-engine
     ports:

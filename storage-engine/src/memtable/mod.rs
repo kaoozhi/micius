@@ -1,3 +1,4 @@
+use crate::chunk::format::U64_SIZE;
 use crate::types::{DataPoint, SeriesKey, ValuePredicate};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
@@ -24,15 +25,25 @@ impl Memtable {
             metric_name: point.metric_name,
             tags: point.tags,
         };
-        let vec = self.entries.entry(key).or_default();
+        let is_new = !self.entries.contains_key(&key);
+        let vec = self.entries.entry(key.clone()).or_default();
         match vec.binary_search_by_key(&point.timestamp_ns, |&(ts, _)| ts) {
             // duplicate timestamp found, overwrite it
             Ok(pos) => vec[pos].1 = point.value,
             // insert in sorted order if timestamp not found
             Err(pos) => {
                 vec.insert(pos, (point.timestamp_ns, point.value));
-                // 16 bytes for (i64, f64) + 16 bytes amortized for Vec/BTreeMap overhead
                 self.size_bytes += size_of::<(i64, f64)>() * 2;
+                if is_new {
+                    // Account for heap-allocated strings in SeriesKey
+                    self.size_bytes += key.metric_name.len()
+                        + key
+                            .tags
+                            .iter()
+                            .map(|(k, v)| k.len() + v.len())
+                            .sum::<usize>()
+                        + U64_SIZE; // BTreeMap node overhead
+                }
                 self.entry_count += 1;
             }
         }
