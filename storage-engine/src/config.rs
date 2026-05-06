@@ -17,6 +17,16 @@ pub struct StorageConfig {
     /// Smaller segments = faster recovery scan but more files
     pub wal_max_segment_bytes: u64,
 
+    /// mpsc channel capacity between gRPC handlers and the WAL task (default 1024).
+    /// Backpressure kicks in when the WAL task falls behind this many pending requests.
+    /// Increase if you see `WAL task shut down` errors under very high write bursts.
+    pub wal_channel_capacity: usize,
+
+    /// Maximum number of Append requests batched into a single fsync (default 256).
+    /// Higher values increase throughput under load; lower values reduce tail latency
+    /// during disk stalls by capping how many callers share one failed fsync.
+    pub wal_max_batch: usize,
+
     /// Memtable flushes to disk after this many bytes (default 32 MB)
     /// Larger threshold = fewer chunk files but more memory usage
     pub memtable_flush_threshold_bytes: usize,
@@ -44,6 +54,8 @@ impl StorageConfig {
             chunk_dir: env_path("MICIUS_CHUNK_DIR", "/var/micius/data/chunks"),
             index_path: env_path("MICIUS_INDEX_PATH", "/var/micius/data/index.bin"),
             wal_max_segment_bytes: env_u64("MICIUS_WAL_MAX_SEGMENT_MB", 64) * 1024 * 1024,
+            wal_channel_capacity: env_usize("MICIUS_WAL_CHANNEL_CAPACITY", 1024),
+            wal_max_batch: env_usize("MICIUS_WAL_MAX_BATCH", 256),
             memtable_flush_threshold_bytes: env_usize("MICIUS_MEMTABLE_FLUSH_MB", 32) * 1024 * 1024,
             compaction_interval_secs: env_u64("MICIUS_COMPACTION_INTERVAL_SECS", 300),
             compaction_min_threshold: env_usize("MICIUS_COMPACTION_MIN_THRESHOLD", 4),

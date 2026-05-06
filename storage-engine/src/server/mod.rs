@@ -11,7 +11,7 @@ use crate::{
         AppendRequest, AppendResponse, CompactRequest, CompactResponse, QueryRequest,
         QueryResponse, SnapshotRequest, SnapshotResponse, storage_service_server::StorageService,
     },
-    wal::{self, writer::WalWriter},
+    wal::{self, group_commit::WalSender, writer::WalWriter},
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -21,7 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub struct StorageServer {
-    pub wal: Arc<Mutex<WalWriter>>,
+    pub wal: WalSender,
     pub memtable: Arc<Mutex<Memtable>>,
     pub index: Arc<RwLock<ChunkIndex>>,
     pub chunk_writer: Arc<ChunkWriter>,
@@ -105,8 +105,12 @@ impl StorageServer {
         }
         tracing::info!(deleted = to_delete.len(), "WAL segments cleaned up");
 
-        // 5. Wrap in Arc ────────────────────────────────────────────────────
-        let wal = Arc::new(Mutex::new(wal_writer));
+        // 5. Spawn WAL group commit task ───────────────────────────────────
+        let wal = WalSender::spawn(
+            wal_writer,
+            config.wal_channel_capacity,
+            config.wal_max_batch,
+        );
         let mem = Arc::new(Mutex::new(memtable));
         let index = Arc::new(RwLock::new(idx));
         let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));
@@ -154,15 +158,14 @@ impl StorageService for StorageServer {
         // fsync happens inside append(). seq is the monotonic token returned
         // to the caller and used later to bound WAL segment deletion.
         let wal_start = std::time::Instant::now();
-        let seq = {
-            let mut wal = self.wal.lock().await;
-            wal.append(&points).await.map_err(|e| {
-                metrics::wal_entries_total()
-                    .with_label_values(&["error"])
-                    .inc();
-                Status::internal(format!("WAL error: {}", e))
-            })?
-        }; // WAL lock released here
+
+        let pts = Arc::new(points);
+        let seq = self.wal.append(Arc::clone(&pts)).await.map_err(|e| {
+            metrics::wal_entries_total()
+                .with_label_values(&["error"])
+                .inc();
+            Status::internal(format!("WAL error: {}", e))
+        })?;
         metrics::wal_append_duration()
             .with_label_values(&["ok"])
             .observe(wal_start.elapsed().as_secs_f64());
@@ -170,11 +173,11 @@ impl StorageService for StorageServer {
             .with_label_values(&["ok"])
             .inc();
 
-        tracing::info!(points = points.len(), seq = seq, "append");
+        tracing::info!(points = pts.len(), seq = seq, "append");
 
         // ── Step 3: Memtable insert ───────────────────────────────────────────
         let mut mem = self.memtable.lock().await;
-        for point in points {
+        for point in pts.iter().cloned() {
             mem.insert(point);
         }
         metrics::memtable_size_bytes().set(mem.size_bytes() as i64);
@@ -189,7 +192,7 @@ impl StorageService for StorageServer {
 
             let chunk_writer = Arc::clone(&self.chunk_writer);
             let index = Arc::clone(&self.index);
-            let wal = Arc::clone(&self.wal);
+            let wal = self.wal.clone();
             tokio::spawn(async move {
                 let flush_start = std::time::Instant::now();
                 match chunk_writer.write(drained).await {
@@ -223,22 +226,19 @@ impl StorageService for StorageServer {
                         // Delete completed WAL segments whose max_seq ≤ seq.
                         // seq was captured at append time — only segments fully
                         // covered by the flushed memtable are eligible.
-                        let paths = {
-                            let mut wal = wal.lock().await;
-                            if let Err(e) = wal.rotate().await {
-                                tracing::error!(error = %e, "WAL rotation after flush failed");
+                        match wal.rotate_and_drain().await {
+                            Ok(paths) => {
+                                let deleted = paths.len();
+                                for path in paths {
+                                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                                        // NotFound is benign — cleaned up by a previous run.
+                                        tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
+                                    }
+                                }
+                                tracing::info!(deleted, seq, "WAL segments cleaned up");
                             }
-                            wal.drain_completed_before(u64::MAX)
-                        }; // WAL lock released before file I/O
-
-                        let deleted = paths.len();
-                        for path in paths {
-                            if let Err(e) = tokio::fs::remove_file(&path).await {
-                                // NotFound is benign — cleaned up by a previous run.
-                                tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
-                            }
+                            Err(e) => tracing::error!(error = %e, "WAL checkpoint failed"),
                         }
-                        tracing::info!(deleted, seq, "WAL segments cleaned up");
                     }
                     Err(e) => {
                         metrics::memtable_flush_total()
@@ -455,7 +455,7 @@ impl StorageService for StorageServer {
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         tracing::info!("snapshot");
-        let seq = self.wal.lock().await.current_sequence();
+        let seq = self.wal.current_sequence();
         let index = self.index.read().await;
 
         crate::index::persistence::save_index(&index, &self.snapshot_path, seq)

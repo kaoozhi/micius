@@ -8,12 +8,12 @@ use crate::wal::proto::WalEntry;
 use prost::Message;
 
 pub struct WalWriter {
-    file: File,
-    current_seq: Sequence,
-    current_size: u64,
+    pub file: File,
+    pub current_seq: Sequence,
+    pub current_size: u64,
     current_segment: u64,
     wal_dir: PathBuf,
-    max_segment_bytes: u64,
+    pub max_segment_bytes: u64,
     completed_segments: Vec<(u64, Sequence)>,
 }
 
@@ -63,9 +63,28 @@ impl WalWriter {
     /// Returns the sequence number assigned to this batch.
     pub async fn append(&mut self, points: &[DataPoint]) -> Result<Sequence> {
         self.current_seq += 1;
+        let frame = WalWriter::encode_frame(self.current_seq, &points);
 
+        // Write then fsync — fsync must complete before returning to the
+        // caller. This is the durability guarantee: once append() returns
+        // Ok, the data survives a process crash.
+        self.file.write_all(&frame).await?;
+        self.file.sync_all().await?;
+
+        self.current_size += frame.len() as u64;
+
+        // Rotate to a new segment if the size threshold is exceeded.
+        // New writes after this point go into the fresh segment.
+        if self.current_size >= self.max_segment_bytes {
+            self.rotate().await?;
+        }
+
+        Ok(self.current_seq)
+    }
+
+    pub fn encode_frame(seq: Sequence, points: &[DataPoint]) -> Vec<u8> {
         let wal_entry = WalEntry {
-            sequence: self.current_seq,
+            sequence: seq,
             points: points.iter().map(Into::into).collect(),
         };
 
@@ -86,21 +105,7 @@ impl WalWriter {
         frame.extend_from_slice(&checksum.to_le_bytes());
         frame.extend_from_slice(&payload);
 
-        // Write then fsync — fsync must complete before returning to the
-        // caller. This is the durability guarantee: once append() returns
-        // Ok, the data survives a process crash.
-        self.file.write_all(&frame).await?;
-        self.file.sync_all().await?;
-
-        self.current_size += frame.len() as u64;
-
-        // Rotate to a new segment if the size threshold is exceeded.
-        // New writes after this point go into the fresh segment.
-        if self.current_size >= self.max_segment_bytes {
-            self.rotate().await?;
-        }
-
-        Ok(self.current_seq)
+        frame
     }
 
     pub async fn rotate(&mut self) -> Result<()> {

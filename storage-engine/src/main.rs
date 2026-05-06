@@ -78,14 +78,14 @@ async fn main() -> anyhow::Result<()> {
     // held simultaneously, avoiding contention with the flush write path.
     {
         let idx_clone = Arc::clone(&server.index);
-        let wal_clone = Arc::clone(&server.wal);
+        let wal_clone = server.wal.clone();
         let index_path = server.snapshot_path.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(60));
             loop {
                 ticker.tick().await;
                 // Temporary guard — WAL lock released at the semicolon
-                let seq = wal_clone.lock().await.current_sequence();
+                let seq = wal_clone.current_sequence();
                 let index = idx_clone.read().await;
                 if let Err(e) = index::persistence::save_index(&index, &index_path, seq).await {
                     tracing::error!(error = %e, "periodic index snapshot failed");
