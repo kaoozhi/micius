@@ -6,8 +6,9 @@ ingestion/vendor/
 query/vendor/
 *.test
 
-# Generated protobuf code
-gen/
+# Generated protobuf code — commit go.mod but not generated .go files
+gen/**/*.go
+gen/**/*.go-grpc
 
 # Environment
 .env
