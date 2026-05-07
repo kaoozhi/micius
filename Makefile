@@ -43,36 +43,6 @@ lint:
 chaos:
 	@echo "Toxiproxy chaos scenarios — not yet implemented"
 
-# ── Benchmark payload generation ──────────────────────────────────────────────
-
-# Generate ghz load-test payloads. Requires: Go 1.25+
-# Output: bench/payloads/append_100k.ndjson  (one AppendRequest JSON per line)
-#
-# Usage:
-#   make bench-gen                        # default: 100K series, batch=100
-#   make bench-gen SERIES=10000           # smaller run for quick smoke test
-#   make bench-gen SERIES=100000 BATCH=500
-#
-# Then run the load test:
-#   ghz --proto proto/storage/v1/storage.proto \
-#       --call storage.v1.StorageService/Append \
-#       --data-file bench/payloads/append_100k.ndjson \
-#       --concurrency 50 \
-#       localhost:50051
-
-SERIES   ?= 100000
-BATCH    ?= 100
-TOTAL    ?= 10000
-
-bench-gen:
-	@mkdir -p bench/payloads
-	cd bench/gen && go run . \
-	  --series   $(SERIES) \
-	  --batch    $(BATCH)  \
-	  --requests $(TOTAL)  \
-	  --out      ../../bench/payloads/append_$(SERIES).ndjson
-	@echo "→ bench/payloads/append_$(SERIES).ndjson ($(TOTAL) requests × $(BATCH) pts)"
-
 # ── Streaming load generator ──────────────────────────────────────────────────
 
 # Real-time synthetic gRPC load generator — no file, no stale timestamps.
