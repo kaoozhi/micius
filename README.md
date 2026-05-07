@@ -62,7 +62,7 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
   │  gRPC Append                                                               │
   │      │                                                                     │
   │      ▼                                                                     │
-  │  WAL.append()  ──── fsync ────► segment file  (CRC32 per frame)            │
+  │  WAL channel ── batch write_all + fsync once ──► segment file (CRC32/frame)│
   │      │                                                                     │
   │      ▼                                                                     │
   │  Memtable.insert()  (BTreeMap · dedup by timestamp)                        │
@@ -91,6 +91,13 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
 
   ┌──────── Background Tasks ──────────────────────────────────────────────────┐
   │                                                                            │
+  │  WAL group commit task  (continuous · spawned once at startup)             │
+  │      ├─ recv().await  park until first message arrives                     │
+  │      ├─ try_recv() drain  collect backlog up to max_batch (non-blocking)   │
+  │      ├─ write_all + sync_all  one fsync for the entire batch               │
+  │      ├─ last_seq.store(Ordering::Release)  publish watermark atomically    │
+  │      └─ oneshot replies  unblock all waiting Append RPCs                   │
+  │                                                                            │
   │  Compaction worker  (every N secs, Mutex released between cycles)          │
   │      compact_once()                                                        │
   │      ├─ find_candidates()   group chunks by size ratio  (file_sizes map)   │
@@ -107,6 +114,23 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
 
 ---
 
+## Performance
+
+**Platform:** macOS host (Intel) · 100,000-series cardinality · 100 points/request
+
+| Concurrency | WAL strategy | Throughput  | pts/s   | P50   | P99    |
+| ----------- | ------------ | ----------- | ------- | ----- | ------ |
+| 1 worker    | Mutex        | 177 req/s   | 17,700  | 4.4ms | 20.9ms |
+| 100 workers | Mutex        | 239 req/s   | 23,873  | 414ms | 604ms  |
+| 100 workers | Group commit | 1,414 req/s | 141,380 | 69ms  | 124ms  |
+| 200 workers | Group commit | 1,459 req/s | 145,864 | 132ms | 206ms  |
+
+Group commit delivers **5.9× throughput** and **6× P50 reduction** at 100 workers. The ceiling at ~1,460 req/s is the memtable Mutex — the WAL is no longer the bottleneck.
+
+See [`docs/benchmarks.md`](docs/benchmarks.md) for full results including EC2 c5.large analysis and bottleneck decomposition.
+
+---
+
 ## Design Highlights
 
 ### Concurrent correctness without deadlocks
@@ -120,9 +144,20 @@ WAL Mutex (temporary, released at semicolon) → Index RwLock (read)
 
 The flush path holds the Index write lock only for `register()`, never while doing disk I/O. The query path holds the Index read lock only during in-memory pruning, releasing it before any `read_series()` call. Eight concurrent-read/concurrent-write integration tests verify this under real multi-thread load with `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`.
 
+### WAL group commit — one fsync for N concurrent writers
+
+Instead of one `fsync` per writer, concurrent Append RPCs enqueue frames on a channel and wait on a oneshot reply. A single background task drains the channel, writes all frames in one `write_all`, and calls `fsync` once for the whole batch — amortising disk cost across all in-flight requests without sacrificing durability.
+
+```
+Before  100 workers × WAL Mutex  →   239 req/s  → 23k pts/s P50 414ms
+After   100 workers × group commit → 1,414 req/s → 141k pts/s P50  69ms   (5.9× throughput · 6× P50)
+```
+
+Batch size emerges naturally from fsync latency × arrival rate — no artificial delay needed. Group commit shifts the bottleneck from the WAL to the memtable Mutex, which now gates throughput at 141k pt/s (~1,460 req/s) on this hardware.
+
 ### Durability before acknowledgement
 
-Every `Append` RPC calls `fsync` on the WAL segment before returning `Ok`. On crash recovery, the engine:
+Every `Append` RPC waits for the WAL group commit task to call `fsync` before returning `Ok` — the durability guarantee is unchanged, only the mechanism differs. No reply is sent until `sync_all()` has completed for the batch containing that request. On crash recovery, the engine:
 1. Loads the last index snapshot (bincode)
 2. Replays WAL entries with CRC32 verification — stops at the first torn write
 3. Flushes recovered points to a new chunk file
@@ -202,14 +237,6 @@ grpcurl -plaintext \
 | ---------------------------------------------------- | -------------------------------------------------------------------------- |
 | [`ci.yml`](.github/workflows/ci.yml)                 | `fmt` · `clippy -D warnings` · `cargo build` · `nextest` · `rustsec audit` |
 | [`production.yml`](.github/workflows/production.yml) | Docker build (GHA layer cache) · gRPC smoke test (Append RPC via grpcurl)  |
-
----
-
-## Performance
-
-> Benchmarks in progress — see [`docs/benchmarks.md`](docs/benchmarks.md) once complete.
-
-Target workload: high-cardinality metrics (100K+ unique series), sustained append-only writes, sub-millisecond query planning.
 
 ---
 
