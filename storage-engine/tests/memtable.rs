@@ -122,16 +122,20 @@ fn test_double_buffer_pattern() {
 fn test_size_tracking() {
     let mut memtable = Memtable::new(1024);
 
-    // Each point costs 32 bytes (16 for tuple + 16 amortized overhead)
+    // Each point: size_of::<(i64, f64)>() * 2 = 32 bytes.
+    // First point of a new series also charges key string lengths:
+    // "example"(7) + "host"(4) + "node-0"(6) + U64_SIZE(8) = 25 bytes.
     let n = 5;
     for i in 0..n {
         memtable.insert(create_point("example", (i + 1) * 100, i as f64));
     }
-    assert_eq!(memtable.size_bytes(), n as usize * 32);
+    let per_point = std::mem::size_of::<(i64, f64)>() * 2;
+    let key_overhead = "example".len() + "host".len() + "node-0".len() + 8;
+    assert_eq!(memtable.size_bytes(), n as usize * per_point + key_overhead);
 
     // Duplicate timestamp — overwrite, size should not change
     memtable.insert(create_point("example", 300, 99.0));
-    assert_eq!(memtable.size_bytes(), n as usize * 32);
+    assert_eq!(memtable.size_bytes(), n as usize * per_point + key_overhead);
     assert_eq!(memtable.entry_count(), n as u64);
 
     // Drain resets to zero

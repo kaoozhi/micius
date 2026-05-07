@@ -138,10 +138,10 @@ async fn wal_task(
                 for (seq, reply) in seqs.into_iter().zip(replies) {
                     let _ = reply.send(Ok(seq));
                 }
-                if writer.current_size >= writer.max_segment_bytes {
-                    if let Err(e) = writer.rotate().await {
-                        tracing::error!(error = %e, "WAL segment rotation failed");
-                    }
+                if writer.current_size >= writer.max_segment_bytes
+                    && let Err(e) = writer.rotate().await
+                {
+                    tracing::error!(error = %e, "WAL segment rotation failed");
                 }
 
                 // handle explicit Rotate request

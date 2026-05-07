@@ -63,7 +63,7 @@ impl WalWriter {
     /// Returns the sequence number assigned to this batch.
     pub async fn append(&mut self, points: &[DataPoint]) -> Result<Sequence> {
         self.current_seq += 1;
-        let frame = WalWriter::encode_frame(self.current_seq, &points);
+        let frame = WalWriter::encode_frame(self.current_seq, points);
 
         // Write then fsync — fsync must complete before returning to the
         // caller. This is the durability guarantee: once append() returns

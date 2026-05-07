@@ -209,22 +209,31 @@ async fn test_check_bloom_present_series_returns_true() {
 async fn test_bloom_absent_series_returns_none() {
     // Write a chunk containing only "cpu.usage,host=node-0"
     let written_key = series_key("cpu.usage", "node-0");
-    // Use a key with very different bytes to ensure bloom returns false (not a false positive)
-    let absent_key = SeriesKey {
-        metric_name: "zzz.definitely.not.present.xxxxxxxxxxx".to_string(),
-        tags: BTreeMap::from([("zzz".to_string(), "zzz".to_string())]),
-    };
-
     let mut data = BTreeMap::new();
     data.insert(written_key, make_points(1_000_000_000, 1_000_000, 10));
-
     let (_dir, path) = write_chunk(data).await;
 
-    let result = ChunkReader::check_bloom(&path, &absent_key)
-        .await
-        .expect("bloom filter check failed");
-
-    assert!(!result, "expected false — series absent from bloom filter");
+    // Bloom is sized for 1 item at 1% FP rate — any single absent key has ~1% chance
+    // of being a false positive. Check 50 distinct absent keys: P(all 50 are false
+    // positives) ≈ (0.01)^50 ≈ 10^-100.
+    let mut any_rejected = false;
+    for i in 0u32..50 {
+        let absent = SeriesKey {
+            metric_name: format!("absent.metric.{}", i),
+            tags: BTreeMap::from([("k".to_string(), format!("v{}", i))]),
+        };
+        if !ChunkReader::check_bloom(&path, &absent)
+            .await
+            .expect("bloom check failed")
+        {
+            any_rejected = true;
+            break;
+        }
+    }
+    assert!(
+        any_rejected,
+        "bloom returned true for all 50 absent keys — filter may be saturated"
+    );
 }
 
 #[tokio::test]
