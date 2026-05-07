@@ -37,6 +37,8 @@ fn test_config(dir: &TempDir) -> StorageConfig {
         chunk_dir: dir.path().join("chunks"),
         index_path: dir.path().join("index.bin"),
         wal_max_segment_bytes: 64 * 1024 * 1024,
+        wal_channel_capacity: 1024,
+        wal_max_batch: 256,
         memtable_flush_threshold_bytes: 32 * 1024 * 1024,
         compaction_interval_secs: 300,
         compaction_min_threshold: 2,

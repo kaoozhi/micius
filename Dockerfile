@@ -37,8 +37,7 @@ RUN rm src/main.rs
 # Copy real source — this layer only invalidates when src/ changes.
 # Dependency compilation above is reused from cache.
 COPY storage-engine/src/ src/
-RUN touch src/main.rs && cargo build --release
-
+RUN rm -f target/release/deps/storage_engine* && cargo build --release
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
 # Alpine variant — cached locally, no apk calls needed in this stage.
 FROM alpine:3.19 AS runtime
@@ -64,7 +63,9 @@ EXPOSE 50051 9091
 ENV MICIUS_WAL_DIR=/var/micius/data/wal \
     MICIUS_CHUNK_DIR=/var/micius/data/chunks \
     MICIUS_INDEX_PATH=/var/micius/data/index.bin \
-    MICIUS_WAL_MAX_SEGMENT_MB=64 \
+    MICIUS_WAL_MAX_SEGMENT_MB=4 \
+    MICIUS_WAL_MAX_BATCH=256\
+    MICIUS_WAL_CHANNEL_CAPACITY=1024 \
     MICIUS_MEMTABLE_FLUSH_MB=32 \
     MICIUS_COMPACTION_INTERVAL_SECS=300 \
     MICIUS_COMPACTION_MIN_THRESHOLD=4 \
