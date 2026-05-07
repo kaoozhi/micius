@@ -17,7 +17,9 @@ pub struct DataPoint {
 /// BTreeMap is used for tags rather than HashMap to guarantee a
 /// deterministic byte representation for hashing and bloom filters.
 /// HashMap iteration order is not stable across runs.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Ord, PartialOrd, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct SeriesKey {
     pub metric_name: String,
     pub tags: BTreeMap<String, String>,
@@ -34,6 +36,31 @@ impl SeriesKey {
         }
         s.into_bytes()
     }
+
+    pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
+        let s = std::str::from_utf8(bytes)
+            .map_err(|e| anyhow::anyhow!("invalid UTF-8 in series key: {e}"))?;
+        let mut parts = s.split(',');
+        let metric_name = parts
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("empty series key bytes"))?
+            .to_string();
+        let mut tags = BTreeMap::new();
+        for kv in parts {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("malformed tag pair: {kv:?}"))?;
+            tags.insert(k.to_string(), v.to_string());
+        }
+        Ok(Self { metric_name, tags })
+    }
+}
+
+impl From<&SeriesKey> for SeriesId {
+    fn from(value: &SeriesKey) -> Self {
+        let bytes = value.to_bytes();
+        xxhash_rust::xxh64::xxh64(&bytes, 0)
+    }
 }
 
 /// Opaque stable identifier assigned to a SeriesKey on first registration.
@@ -48,30 +75,30 @@ pub type ChunkId = u64;
 /// WAL sequence number — monotonically increasing per batch.
 pub type Sequence = u64;
 
-/// Metadata about a chunk file stored in the ChunkIndex.
-/// Does not contain the chunk data itself — only enough information
-/// to locate and evaluate the chunk during query planning.
+/// Records a single series' presence within a specific chunk file.
+/// Stored in `ChunkIndex.time_index` keyed by (SeriesId, time_start_ns).
+/// Series-level: each series in a multi-series chunk has its own entry
+/// with its own time range and column footprint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChunkMeta {
+pub struct SeriesChunkEntry {
     pub chunk_id: ChunkId,
     pub series_id: SeriesId,
-    pub time_start_ns: i64,
-    pub time_end_ns: i64,
-    pub file_path: PathBuf,
-    pub size_bytes: u64,
+    pub time_start_ns: i64, // this series' earliest timestamp in this chunk
+    pub time_end_ns: i64,   // this series' latest timestamp in this chunk
+    pub size_bytes: usize,  // byte footprint of this series' columns in the file
 }
 
-/// Per-chunk value statistics used for predicate pushdown.
-/// Stored alongside ChunkMeta in the ChunkIndex.
-/// Computed during the chunk write from the raw value column.
+/// Value statistics for one series within one chunk — used for predicate pushdown.
+/// Stored in `ChunkIndex.chunk_stats` keyed by (ChunkId, SeriesId).
+/// Series-level: min/max reflect only this series' values, not the whole file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ChunkStats {
+pub struct SeriesChunkStats {
     pub min_value: f64,
     pub max_value: f64,
     pub null_count: u64, // reserved for future nullable value support
 }
 
-impl ChunkStats {
+impl SeriesChunkStats {
     pub fn from_values(values: &[f64]) -> Option<Self> {
         let min = values.iter().cloned().reduce(f64::min)?;
         let max = values.iter().cloned().reduce(f64::max)?;
@@ -80,5 +107,38 @@ impl ChunkStats {
             max_value: max,
             null_count: 0,
         })
+    }
+}
+
+/// Chunk-level metadata stored in `ChunkIndex.chunk_files` keyed by ChunkId.
+/// Describes the chunk file as a whole — shared by all series flushed together.
+/// Used by the compaction worker to locate files and group them by size.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ChunkMeta {
+    pub file_path: PathBuf,
+    pub file_size: u64,
+}
+
+pub enum ValuePredicate {
+    GreaterThan(f64),
+    LessThan(f64),
+    Between(f64, f64),
+}
+
+impl ValuePredicate {
+    pub fn matches(&self, min_val: f64, max_val: f64) -> bool {
+        match self {
+            Self::GreaterThan(t) => max_val > *t,
+            Self::LessThan(t) => min_val < *t,
+            Self::Between(lo, hi) => min_val <= *hi && max_val >= *lo,
+        }
+    }
+
+    pub fn satisfies(&self, value: f64) -> bool {
+        match self {
+            Self::GreaterThan(t) => value > *t,
+            Self::LessThan(t) => value < *t,
+            Self::Between(lo, hi) => value >= *lo && value <= *hi,
+        }
     }
 }

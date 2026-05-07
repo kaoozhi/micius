@@ -68,17 +68,21 @@ message QueryRequest {
   map<string, string> tag_filters = 2;
 
   // Inclusive time range in unix nanoseconds.
-  // time_start_ns == 0 means "from the beginning of time".
-  // time_end_ns   == 0 means "up to now".
-  sint64 time_start_ns = 3;
-  sint64 time_end_ns   = 4;
+  // When absent: time_start_ns defaults to i64::MIN (all history),
+  //              time_end_ns   defaults to i64::MAX (up to now).
+  // Using optional avoids ambiguity with 0 (Unix epoch, a valid timestamp).
+  optional sint64 time_start_ns = 3;
+  optional sint64 time_end_ns   = 4;
 }
 
 // One streamed point. Keeping this flat (no nested DataPoint) avoids
 // an extra allocation per point during streaming decode on the Go side.
+// series_id is the stable xxhash64 of the series key — the Go query layer
+// maps it back to (metric_name, tags) using its own in-memory registry.
 message QueryResponse {
-  sint64 timestamp_ns = 1;
-  double value        = 2;
+  uint64 series_id    = 1;
+  sint64 timestamp_ns = 2;
+  double value        = 3;
 }
 
 // ── Maintenance ───────────────────────────────────────────────────────────────
@@ -90,6 +94,7 @@ message CompactRequest {
 message CompactResponse {
   // Number of chunk files merged in this pass.
   uint32 chunks_merged = 1;
+  uint64 bytes_freed   = 2;
 }
 
 message SnapshotRequest {

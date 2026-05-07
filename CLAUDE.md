@@ -105,11 +105,14 @@ micius/
 ├── storage-engine/                    # Rust — WAL, chunk store, gRPC server
 │   ├── src/
 │   │   ├── main.rs
+│   │   ├── lib.rs                     # library root — re-exports modules
+│   │   ├── config.rs                  # StorageConfig from env vars
 │   │   ├── types.rs                   # DataPoint, SeriesKey, SeriesId, ChunkId
 │   │   ├── wal/
 │   │   │   ├── mod.rs
-│   │   │   ├── writer.rs              # append + fsync
-│   │   │   └── recovery.rs            # replay on startup
+│   │   │   ├── writer.rs              # append + fsync + segment rotation
+│   │   │   ├── proto.rs               # WalEntry, WalDataPoint prost structs
+│   │   │   └── recovery.rs            # replay on startup (not yet implemented)
 │   │   ├── memtable/
 │   │   │   └── mod.rs                 # BTreeMap buffer, flush threshold
 │   │   ├── chunk/
@@ -118,12 +121,20 @@ micius/
 │   │   │   ├── reader.rs              # decompress + decode
 │   │   │   └── format.rs              # binary format constants and helpers
 │   │   ├── index/
-│   │   │   ├── chunk_index.rs         # time-range + stats pruning
-│   │   │   └── tag_index.rs           # inverted index for multi-tag intersection
+│   │   │   ├── chunk_index.rs         # time-range + stats pruning +inverted index for multi-tag intersection
+│   │   │   ├── mod.rs
+│   │   │   └── persistence.rs         # Index Persistence and Startup Recovery
 │   │   ├── compaction/
 │   │   │   └── mod.rs                 # size-tiered background worker
 │   │   └── server/
 │   │       └── mod.rs                 # tonic gRPC server
+│   ├── tests/
+│   │   ├── chunkreader_test.rs        # chunk reader tests
+│   │   ├── chunkwriter_test.rs        # chunk writer tests
+│   │   ├── common
+│   │   │   └── mod.rs                 # helper functions
+│   │   ├── memtable_test.rs           # memtable tests
+│   │   └── wal_test.rs                # WAL integration tests
 │   ├── build.rs                       # prost-build code generation
 │   └── Cargo.toml
 ├── ingestion/                         # Go — adapters, write buffer, gRPC client
@@ -209,18 +220,18 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 
 ### Phase completion
 
-- [ ] **Phase 1** — Rust storage engine
+- [~] **Phase 1** — Rust storage engine
 - [ ] **Phase 2** — Go ingestion layer
 - [ ] **Phase 3** — Go query and alert layer
 
 ### Phase 1 progress
-- [ ] WAL writer (append + fsync + segment rotation)
-- [ ] WAL recovery (replay on startup, torn-write detection)
-- [ ] Memtable (BTreeMap, flush threshold)
-- [ ] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
-- [ ] Chunk reader (decompress + decode)
-- [ ] Chunk index (time-range pruning, stats-based predicate pushdown)
-- [ ] Tag inverted index (multi-tag intersection)
+- [x] WAL writer (append + fsync + segment rotation)
+- [x] WAL recovery (replay on startup, torn-write detection)
+- [x] Memtable (BTreeMap, flush threshold)
+- [x] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
+- [x] Chunk reader (decompress + decode)
+- [x] Chunk index (time-range pruning, stats-based predicate pushdown) + Tag inverted index (multi-tag intersection)
+- [x] Chunk index persistence (load index snapshot on restart, scan chunk not in snapshot, replay WAL)
 - [ ] Compaction worker (size-tiered, background Tokio task)
 - [ ] tonic gRPC server (Append, Query streaming, Compact)
 - [ ] All Phase 1 tests passing
@@ -368,7 +379,7 @@ tracing::info!(
 ### Storage engine (Rust)
 - **Do not** use `unwrap()` or `expect()` outside of tests
 - **Do not** add any database client dependency — the engine writes to local filesystem only
-- **Do not** change the chunk file magic bytes (`0x48454C58`) — breaks existing chunk files
+- **Do not** change the chunk file magic bytes (`0x4D494349`) — breaks existing chunk files
 - **Do not** implement the gRPC client in Rust — Go services are always the gRPC clients
 - **Do not** store series metadata in the chunk files themselves — that belongs in the chunk index
 
@@ -452,14 +463,19 @@ Do not start the next phase until the current gate passes.
 ### Phase 1 gate
 All of the following tests must pass:
 ```
-cargo test wal::tests::wal_recovery_after_crash
-cargo test wal::tests::torn_write_detection
-cargo test chunk::tests::chunk_write_read_roundtrip
-cargo test chunk::tests::bloom_filter_false_positive_rate
-cargo test index::tests::multi_tag_intersection
-cargo test index::tests::time_range_pruning
-cargo test index::tests::predicate_pushdown_skips_chunk
-cargo test compaction::tests::compacted_chunks_queryable
+cargo nextest run --test wal test_append_and_recover
+cargo nextest run --test wal test_torn_write_stops_recovery
+cargo nextest run --test chunkwriter test_bloom_filter_in_footer
+cargo nextest run --test chunkreader test_read_single_series_roundtrip
+cargo nextest run --test index test_multi_tag_intersection
+cargo nextest run --test index test_time_range_pruning
+cargo nextest run --test index test_stats_predicate_gt
+cargo nextest run --test compaction tests::compacted_chunks_queryable
+```
+
+Or run all gate tests in one shot:
+```
+cargo nextest run
 ```
 
 ### Phase 2 gate

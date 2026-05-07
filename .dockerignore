@@ -1,0 +1,21 @@
+# Rust build artefacts — must exclude or context upload takes minutes
+storage-engine/target/
+
+# Version control
+.git/
+.github/
+
+# Local secrets
+.env
+
+# Go vendor directories (not needed for storage-engine build)
+ingestion/
+query/
+
+# Docs and plans
+docs/
+
+# Editor
+.idea/
+.vscode/
+.DS_Store
