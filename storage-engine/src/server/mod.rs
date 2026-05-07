@@ -98,12 +98,19 @@ impl StorageServer {
             wal_writer.rotate().await?;
         }
         let to_delete = wal_writer.drain_completed_before(u64::MAX);
+        let mut deleted = 0usize;
         for path in &to_delete {
             if let Err(e) = tokio::fs::remove_file(path).await {
                 tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
+                continue;
             }
+            deleted += 1;
         }
-        tracing::info!(deleted = to_delete.len(), "WAL segments cleaned up");
+        if deleted == 0 {
+            tracing::warn!(to_delete = to_delete.len(), "failed to clean up semgents");
+        } else {
+            tracing::info!(deleted = deleted, "WAL segments cleaned up");
+        }
 
         // 5. Spawn WAL group commit task ───────────────────────────────────
         let wal = WalSender::spawn(
