@@ -2,7 +2,9 @@
 use lz4_flex::frame;
 use prost::Message;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use storage_engine::types::DataPoint;
+use storage_engine::wal::group_commit::WalSender;
 use storage_engine::wal::recovery::recover;
 use storage_engine::wal::writer::WalWriter;
 use tempfile::tempdir;
@@ -239,6 +241,108 @@ async fn test_drain_completed_before_boundary() {
         1,
         "segment with max_seq={max_seq} must be returned at flushed_seq={max_seq}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Group commit tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_group_commit_sequential_sequences() {
+    let dir = tempdir().unwrap();
+    let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
+    let wal = WalSender::spawn(writer, 128, 64);
+
+    for expected in 1u64..=5 {
+        let seq = wal.append(Arc::new(sample_points(3))).await.unwrap();
+        assert_eq!(seq, expected);
+    }
+}
+
+#[tokio::test]
+async fn test_group_commit_current_sequence_tracks_committed() {
+    let dir = tempdir().unwrap();
+    let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
+    let wal = WalSender::spawn(writer, 128, 64);
+
+    assert_eq!(wal.current_sequence(), 0, "no writes yet — must be 0");
+
+    for i in 1u64..=3 {
+        let seq = wal.append(Arc::new(sample_points(2))).await.unwrap();
+        // current_sequence() must reflect the commit before append() returns
+        assert_eq!(wal.current_sequence(), seq);
+        assert_eq!(seq, i);
+    }
+}
+
+// Each task starts simultaneously via a Barrier so multiple sends land in the
+// channel while wal_task is blocked on a single fsync — exercising the batch path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_group_commit_concurrent_appends_unique_sequences() {
+    use tokio::task::JoinSet;
+
+    const N: usize = 50;
+    let dir = tempdir().unwrap();
+    let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
+    // WalSender is Clone — each task gets its own handle to the same channel.
+    let wal = WalSender::spawn(writer, 256, 128);
+    let barrier = Arc::new(tokio::sync::Barrier::new(N));
+
+    let mut set = JoinSet::new();
+    for _ in 0..N {
+        let wal = wal.clone();
+        let barrier = Arc::clone(&barrier);
+        set.spawn(async move {
+            barrier.wait().await; // release all N tasks at once
+            wal.append(Arc::new(sample_points(2))).await
+        });
+    }
+
+    let mut sequences: Vec<u64> = Vec::with_capacity(N);
+    while let Some(res) = set.join_next().await {
+        sequences.push(res.unwrap().unwrap());
+    }
+
+    assert_eq!(sequences.len(), N, "all tasks must complete");
+    sequences.sort_unstable();
+    sequences.dedup();
+    assert_eq!(sequences.len(), N, "all sequences must be unique");
+    assert_eq!(*sequences.first().unwrap(), 1);
+    assert_eq!(*sequences.last().unwrap() as usize, N);
+}
+
+#[tokio::test]
+async fn test_group_commit_data_is_recoverable() {
+    let dir = tempdir().unwrap();
+    let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
+    let wal = WalSender::spawn(writer, 128, 64);
+
+    let batch_1 = sample_points(3);
+    let batch_2 = sample_points(2);
+    wal.append(Arc::new(batch_1.clone())).await.unwrap();
+    wal.append(Arc::new(batch_2.clone())).await.unwrap();
+    // append() only returns after sync_all() — data is durable before drop.
+    drop(wal);
+
+    let recovered = recover(dir.path()).await.unwrap();
+    assert_eq!(recovered.points.len(), batch_1.len() + batch_2.len());
+    assert_points_eq(&batch_1, &recovered.points, 0);
+    assert_points_eq(&batch_2, &recovered.points, batch_1.len());
+}
+
+#[tokio::test]
+async fn test_group_commit_rotate_and_drain_returns_segment() {
+    let dir = tempdir().unwrap();
+    let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
+    let wal = WalSender::spawn(writer, 128, 64);
+
+    wal.append(Arc::new(sample_points(5))).await.unwrap();
+
+    // rotate_and_drain: closes the current segment into completed, opens a new
+    // one, and returns all completed segment paths.
+    let paths = wal.rotate_and_drain().await.unwrap();
+    assert_eq!(paths.len(), 1, "one segment completed after first rotation");
+    assert!(paths[0].exists(), "returned path must exist on disk");
 }
 
 // ---------------------------------------------------------------------------
