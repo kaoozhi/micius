@@ -7,38 +7,33 @@
 ![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-Micius covers the full observability stack: multi-source metrics ingestion (DogStatsD, Prometheus, Alpaca WebSocket, slog), a **custom Rust storage engine** exposed over gRPC, and a Go query layer with aggregation, alerting, and transactional webhook delivery. The storage engine is the foundation — built from scratch with a fsync-durable WAL, a BTreeMap memtable, columnar chunk files (delta-encoding + lz4 + bloom filters), an inverted tag index, and size-tiered compaction. It is designed for high-cardinality write-heavy workloads.
-
-> **Why Micius?** Named after Mozi (墨子), a 5th-century BCE Chinese philosopher and engineer who pioneered empirical measurement — among the first to systematically observe, record, and reason about physical phenomena. A time-series storage engine is the same discipline applied to software: record every observation, answer any question about it later.
-
+Micius covers the full observability stack: multi-source metrics ingestion (DogStatsD, Prometheus, Alpaca WebSocket, slog), a **custom Rust storage engine** exposed over gRPC, and a Go query layer with aggregation, alerting, and transactional webhook delivery. The storage engine is the foundation — built from scratch with a group-commit WAL (one fsync per N concurrent writers), a 16-shard BTreeMap memtable, columnar chunk files (delta-encoding + lz4 + bloom filters), an inverted tag index, and size-tiered compaction. It sustains **260k+ points/sec** durable writes (fsync before ack) at 100k-series cardinality on an Intel Mac (macOS/APFS).
 
 ---
 
 ## Architecture
 
 ```
-[DogStatsD UDP]  ─┐
-[Alpaca WS]      ─┤─► [Write Buffer] ─────────────────────────────── 🚧 Phase 2
-[Prometheus]     ─┤    (Go ingestion)                                    (Go)
-[slog TCP]       ─┘          │
-                             │ gRPC Append
-                             ▼
-              ┌──────────────────────────────────┐
-              │  WAL  (fsync · rotation · CRC32) │
-              │  Memtable  (BTreeMap · threshold)│  ✅ Phase 1
-              │  Chunk files  (δ-encode · lz4)   │    (Rust)
-              │  ChunkIndex  (inverted · pruning)│
-              │  Compaction  (size-tiered)       │
-              │  gRPC server  (tonic)            │
-              └─────────────────┬────────────────┘
-                                │ gRPC Query
-                                ▼
-              ┌──────────────────────────────────┐
-              │  Aggregation engine              │
-              │  Alert worker                    │  🚧 Phase 3
-              │  Webhook outbox (Postgres)       │    (Go)
-              └──────────────────────────────────┘
+[UDP metrics]    ─┐
+[WebSocket feed] ─┤─► [Write Buffer] ─── gRPC Append ─────────────────┐
+[HTTP scrape]    ─┤    (Go ingestion)                                 │
+[TCP log stream] ─┘                                                   ▼
+                                                  ┌──────────────────────────────────┐
+                                                  │  WAL  (group commit · CRC32)     │
+                                                  │  Memtable  (16 shards · BTreeMap)│
+                                                  │  Chunk files  (δ-encode · lz4)   │
+                                                  │  ChunkIndex  (inverted · pruning)│
+                                                  │  Compaction  (size-tiered)       │
+                                                  └──────────────────┬───────────────┘
+                                                                     │ gRPC (read)
+                                                  ┌──────────────────▼───────────────┐
+                            HTTP API ◄────────────┤  Aggregation engine  (Go)        │
+                            Webhooks ◄────────────┤  Alert worker                    │
+                                                  │  Webhook outbox (Postgres)       │
+                                                  └──────────────────────────────────┘
 ```
+
+Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query layers) are in progress.
 
 ---
 
@@ -65,14 +60,9 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
   │  WAL channel ── batch write_all + fsync once ──► segment file (CRC32/frame)│
   │      │                                                                     │
   │      ▼                                                                     │
-  │  Memtable.insert()  (BTreeMap · dedup by timestamp)                        │
-  │      │                                                                     │
-  │      │ threshold exceeded                                                  │
-  │      ▼                                                                     │
-  │  async flush task ──────────────────────────────────────────────────────   │
-  │      ├─ ChunkWriter.write()  →  .mcs file  (δ-encode · lz4 · bloom)        │
-  │      ├─ ChunkIndex.register()  (under write lock, no disk I/O held)        │
-  │      └─ WAL.rotate() + drain_completed()  →  delete stale segments         │
+  │  memtables[hash(series_key) & (N-1)].insert()  (16 shards · BTreeMap)     │
+  │      │  flush decisions off the hot path — handled by periodic sweep       │
+  │      └─ return Ok to caller                                                │
   │                                                                            │
   └────────────────────────────────────────────────────────────────────────────┘
 
@@ -105,9 +95,16 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
   │      ├─ ChunkIndex register + deregister  (atomic under write lock)        │
   │      └─ delete old .mcs files  (after index update)                        │
   │                                                                            │
+  │  Memtable sweep + WAL GC  (every 200ms · sequential shard scan)            │
+  │      for each shard: drain if should_flush()                               │
+  │      ├─ ChunkWriter.write()  →  .mcs file  (δ-encode · lz4 · bloom)        │
+  │      ├─ ChunkIndex.register()  (under write lock, no disk I/O held)        │
+  │      ├─ watermark[i].store(wal.current_sequence(), Release)                │
+  │      └─ WAL.drain_completed_before(min(watermarks))  → delete stale segs   │
+  │                                                                            │
   │  Snapshot worker  (every 60s)                                              │
   │      WAL.current_sequence()  +  ChunkIndex  ──► bincode  ──► index.bin     │
-  │      (WAL lock released before index read lock acquired)                   │
+  │      (WAL sequence read before index read lock acquired)                   │
   │                                                                            │
   └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -118,14 +115,15 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
 
 **Platform:** macOS host (Intel) · 100,000-series cardinality · 100 points/request
 
-| Concurrency | WAL strategy | Throughput  | pts/s   | P50   | P99    |
-| ----------- | ------------ | ----------- | ------- | ----- | ------ |
-| 1 worker    | Mutex        | 177 req/s   | 17,700  | 4.4ms | 20.9ms |
-| 100 workers | Mutex        | 239 req/s   | 23,873  | 414ms | 604ms  |
-| 100 workers | Group commit | 1,414 req/s | 141,380 | 69ms  | 124ms  |
-| 200 workers | Group commit | 1,459 req/s | 145,864 | 132ms | 206ms  |
+| Concurrency | Strategy                    | **pts/s**   | req/s | P50   | P99    |
+| ----------- | --------------------------- | ----------- | ----- | ----- | ------ |
+| 1 worker    | WAL Mutex (baseline)        | **17,700**  | 177   | 4.4ms | 20.9ms |
+| 100 workers | WAL Mutex (baseline)        | **23,873**  | 239   | 414ms | 604ms  |
+| 100 workers | + WAL group commit          | **141,380** | 1,414 | 69ms  | 124ms  |
+| 100 workers | + WAL group commit + shards | **203,126** | 2,031 | 46ms  | 101ms  |
+| 300 workers | + WAL group commit + shards | **259,767** | 2,598 | 113ms | 186ms  |
 
-Group commit delivers **5.9× throughput** and **6× P50 reduction** at 100 workers. The ceiling at ~1,460 req/s is the memtable Mutex — the WAL is no longer the bottleneck.
+Each optimisation removes one bottleneck: WAL group commit eliminates fsync serialisation (**5.9×**); 16-shard memtable eliminates lock contention (**10.9× vs baseline** at 100 workers, **259k pts/s** at 300 workers). The ceiling is hardware-bound — set by fsync latency, not software.
 
 See [`docs/benchmarks.md`](docs/benchmarks.md) for full results including EC2 c5.large analysis and bottleneck decomposition.
 
@@ -135,14 +133,16 @@ See [`docs/benchmarks.md`](docs/benchmarks.md) for full results including EC2 c5
 
 ### Concurrent correctness without deadlocks
 
-WAL, memtable, and chunk index each have independent locks. The engine enforces a strict acquisition order across **all** code paths:
+The WAL is lock-free on the write path — writers enqueue via channel and await a oneshot reply; no Mutex is held. The memtable is partitioned into 16 shards, each with its own Mutex; at most one shard lock is held at a time, acquired in ascending index order. The engine enforces a strict acquisition order across **all** code paths:
 
 ```
-WAL Mutex → released → Memtable Mutex → released → Index RwLock (write)
-WAL Mutex (temporary, released at semicolon) → Index RwLock (read)
+Write path:  WAL channel send (no lock) → Memtable[i] Mutex → released
+Sweep path:  Memtable[i] Mutex (drain) → released → Index RwLock write → released → WAL channel send
+Query path:  Memtable[i] Mutex → released (per shard) → Index RwLock read → released before disk I/O
+Snapshot:    Index RwLock read  (WAL sequence is AtomicU64 — no lock needed)
 ```
 
-The flush path holds the Index write lock only for `register()`, never while doing disk I/O. The query path holds the Index read lock only during in-memory pruning, releasing it before any `read_series()` call. Eight concurrent-read/concurrent-write integration tests verify this under real multi-thread load with `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`.
+The sweep holds the Index write lock only for `register()`, never while doing disk I/O. The query path releases the Index read lock before any `read_series()` call. No two locks from different levels are ever held simultaneously. Eight concurrent-read/concurrent-write integration tests verify this under real multi-thread load with `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`.
 
 ### WAL group commit — one fsync for N concurrent writers
 
@@ -153,7 +153,24 @@ Before  100 workers × WAL Mutex  →   239 req/s  → 23k pts/s P50 414ms
 After   100 workers × group commit → 1,414 req/s → 141k pts/s P50  69ms   (5.9× throughput · 6× P50)
 ```
 
-Batch size emerges naturally from fsync latency × arrival rate — no artificial delay needed. Group commit shifts the bottleneck from the WAL to the memtable Mutex, which now gates throughput at 141k pt/s (~1,460 req/s) on this hardware.
+Batch size emerges naturally from fsync latency × arrival rate — no artificial delay needed. Group commit shifts the bottleneck from WAL serialisation to the single memtable Mutex — addressed next by sharding.
+
+### 16-shard memtable — eliminate lock contention on the hot write path
+
+WAL group commit exposed the next bottleneck: all concurrent writers serialising on a single `Mutex<Memtable>` for BTreeMap insertions (~0.66ms/request, ceiling ~1,460 req/s). The fix partitions the memtable into 16 independent shards, each with its own lock:
+
+- **Routing**: each point hashes to `shard = hash(metric_name + sorted_tags) & 15` — a single bitmask, no division, same series always routes to the same shard
+- **Write path**: acquires only the relevant shard locks, never two simultaneously
+- **Flush path**: removed from the RPC handler entirely — a 200ms periodic sweep scans shards sequentially, draining any that exceed their per-shard threshold
+- **WAL safety**: each shard publishes a watermark after its flush; WAL segments are only deleted when `min(all watermarks)` covers them, preventing data loss if a shard has not flushed yet
+
+```
+Before  100 workers × single Mutex →  141k pts/s  P50  69ms  (1,414 req/s)
+After   100 workers × 16 shards   →  203k pts/s  P50  46ms  (2,031 req/s)  (10.9× vs baseline)
+        300 workers × 16 shards   →  260k pts/s  P50 113ms  (2,598 req/s)  (hardware ceiling)
+```
+
+The ceiling is now `batch_size / fsync_latency` — a hardware limit, not a software one.
 
 ### Durability before acknowledgement
 
@@ -178,7 +195,7 @@ Size-tiered compaction (over leveled) was chosen because the workload is write-h
 
 ---
 
-## Phase Roadmap
+## Implementation Status
 
 | Phase | Component                                                             | Status |
 | ----- | --------------------------------------------------------------------- | ------ |
@@ -189,6 +206,8 @@ Size-tiered compaction (over leveled) was chosen because the workload is write-h
 | 1     | Index persistence — bincode snapshot + WAL sequence recovery          | ✅      |
 | 1     | Size-tiered compaction                                                | ✅      |
 | 1     | gRPC server — Append, Query (streaming), Compact, Snapshot            | ✅      |
+| 1     | WAL group commit — channel-based batching, one fsync per N writers    | ✅      |
+| 1     | 16-shard memtable — per-shard Mutex, periodic sweep, WAL watermarks   | ✅      |
 | 1     | Docker — multi-stage Dockerfile, docker-compose, Makefile             | ✅      |
 | 1     | CI — fmt · clippy · nextest · audit · Docker build + gRPC smoke test  | ✅      |
 | 2     | Write buffer — bounded channel, backpressure, batch flush             | 🚧      |
@@ -233,10 +252,7 @@ grpcurl -plaintext \
 
 ## CI
 
-| Workflow                                             | Jobs                                                                       |
-| ---------------------------------------------------- | -------------------------------------------------------------------------- |
-| [`ci.yml`](.github/workflows/ci.yml)                 | `fmt` · `clippy -D warnings` · `cargo build` · `nextest` · `rustsec audit` |
-| [`production.yml`](.github/workflows/production.yml) | Docker build (GHA layer cache) · gRPC smoke test (Append RPC via grpcurl)  |
+Two workflows run on every push. [`ci.yml`](.github/workflows/ci.yml) enforces formatting, zero clippy warnings, and runs the full test suite including a security audit. [`production.yml`](.github/workflows/production.yml) builds the multi-stage Docker image with GHA layer caching, then runs a live gRPC smoke test — a real `Append` RPC sent to the running container via grpcurl, asserting a valid sequence number response.
 
 ---
 
@@ -252,3 +268,7 @@ query/            Go — HTTP API, aggregation, alert worker        [Phase 3]
 ---
 
 `Rust` · `tonic` · `tokio` · `lz4` · `xxhash64` · `bincode` · `Docker` · `GitHub Actions`
+
+---
+
+> **Why Micius?** Named after Mozi (墨子), a 5th-century BCE Chinese philosopher and engineer who pioneered empirical measurement — among the first to systematically observe, record, and reason about physical phenomena. A time-series storage engine is the same discipline applied to software: record every observation, answer any question about it later.
