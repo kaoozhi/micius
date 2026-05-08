@@ -64,7 +64,9 @@ chaos:
 
 ADDR     ?= localhost:50051
 WORKERS  ?= 50
+BATCH    ?= 100
 DURATION ?= 30s
+SERIES   ?= 100000
 RPS      ?= 0
 
 bench-load:

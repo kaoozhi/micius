@@ -5,7 +5,7 @@ use crate::{
     compaction::CompactionWorker,
     config::StorageConfig,
     index::{self, chunk_index::ChunkIndex},
-    memtable::Memtable,
+    memtable::{self, Memtable},
     metrics,
     proto::storage::v1::{
         AppendRequest, AppendResponse, CompactRequest, CompactResponse, QueryRequest,
@@ -16,17 +16,21 @@ use crate::{
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use tokio::sync::{Mutex, RwLock};
+use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub struct StorageServer {
     pub wal: WalSender,
-    pub memtable: Arc<Mutex<Memtable>>,
+    pub memtables: Vec<Arc<Mutex<Memtable>>>,
     pub index: Arc<RwLock<ChunkIndex>>,
     pub chunk_writer: Arc<ChunkWriter>,
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
     pub snapshot_path: PathBuf,
+    pub mem_shard_watermarks: Vec<Arc<AtomicU64>>,
 }
 
 impl StorageServer {
@@ -106,10 +110,8 @@ impl StorageServer {
             }
             deleted += 1;
         }
-        if deleted == 0 {
-            tracing::warn!(to_delete = to_delete.len(), "failed to clean up semgents");
-        } else {
-            tracing::info!(deleted = deleted, "WAL segments cleaned up");
+        if deleted == 0 && !to_delete.is_empty() {
+            tracing::warn!(to_delete = to_delete.len(), "failed to clean up segments");
         }
 
         // 5. Spawn WAL group commit task ───────────────────────────────────
@@ -118,7 +120,6 @@ impl StorageServer {
             config.wal_channel_capacity,
             config.wal_max_batch,
         );
-        let mem = Arc::new(Mutex::new(memtable));
         let index = Arc::new(RwLock::new(idx));
         let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));
 
@@ -128,14 +129,25 @@ impl StorageServer {
             config.compaction_min_threshold,
             config.compaction_size_ratio,
         )));
-
+        let memtables: Vec<Arc<Mutex<Memtable>>> = (0..config.memtable_shards)
+            .map(|_| {
+                Arc::new(Mutex::new(Memtable::new(
+                    config.memtable_flush_threshold_bytes / config.memtable_shards,
+                )))
+            })
+            .collect();
+        let initial_seq = wal.current_sequence();
+        let watermarks: Vec<Arc<AtomicU64>> = (0..config.memtable_shards)
+            .map(|_| Arc::new(AtomicU64::new(initial_seq)))
+            .collect();
         Ok(Self {
             wal,
-            memtable: mem,
+            memtables,
             index,
             chunk_writer: writer,
             compaction_worker,
             snapshot_path: config.index_path.clone(),
+            mem_shard_watermarks: watermarks,
         })
     }
 }
@@ -183,80 +195,30 @@ impl StorageService for StorageServer {
         tracing::info!(points = pts.len(), seq = seq, "append");
 
         // ── Step 3: Memtable insert ───────────────────────────────────────────
-        let mut mem = self.memtable.lock().await;
-        for point in pts.iter().cloned() {
-            mem.insert(point);
-        }
-        metrics::memtable_size_bytes().set(mem.size_bytes() as i64);
+        // Route each point to its shard by hashing the series key, then acquire
+        // only the relevant shard locks. Flush decisions are handled by the
+        // periodic sweep task — this path returns immediately after WAL + insert.
+        // Sort point indices by shard so each shard lock is acquired exactly once.
+        // Allocates one Vec of length N instead of shards_num empty inner Vecs,
+        // which matters for small batches (single-point appends, low-volume paths).
+        let shards_num = self.memtables.len();
+        let mut indexed: Vec<(usize, usize)> = pts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (memtable::shard_index(p, shards_num), i))
+            .collect();
+        indexed.sort_unstable_by_key(|(shard, _)| *shard);
 
-        // ── Step 4: Trigger async flush if threshold exceeded ─────────────────
-        // Drain is atomic under the memtable lock. The flush itself runs in a
-        // background task so this RPC returns immediately after the WAL fsync.
-        if mem.should_flush() {
-            let drained = mem.drain();
-            drop(mem); // release memtable lock before spawning
-            tracing::debug!(series = drained.len(), seq, "flush triggered");
-
-            let chunk_writer = Arc::clone(&self.chunk_writer);
-            let index = Arc::clone(&self.index);
-            let wal = self.wal.clone();
-            tokio::spawn(async move {
-                let flush_start = std::time::Instant::now();
-                match chunk_writer.write(drained).await {
-                    Ok(result) => {
-                        // Register all series from the new chunk under a single
-                        // write lock acquisition — atomic from the query path's view.
-                        let mut index = index.write().await;
-                        for s in &result.series_results {
-                            index.register(
-                                &s.series_key,
-                                s.entry.clone(),
-                                s.stats.clone(),
-                                result.chunk_meta.clone(),
-                            );
-                        }
-                        metrics::chunk_files_total().set(index.chunk_file_count() as i64);
-                        metrics::index_series_count().set(index.series_count() as i64);
-                        tracing::info!(
-                            series  = result.series_results.len(),
-                            chunk   = ?result.chunk_meta.file_path,
-                            "memtable flushed"
-                        );
-                        metrics::chunk_bytes_written_total().inc_by(result.chunk_meta.file_size);
-                        metrics::memtable_flush_duration_seconds()
-                            .observe(flush_start.elapsed().as_secs_f64());
-                        metrics::memtable_flush_total()
-                            .with_label_values(&["ok"])
-                            .inc();
-                        drop(index); // release index lock before acquiring WAL lock
-
-                        // Delete completed WAL segments whose max_seq ≤ seq.
-                        // seq was captured at append time — only segments fully
-                        // covered by the flushed memtable are eligible.
-                        match wal.rotate_and_drain().await {
-                            Ok(paths) => {
-                                let deleted = paths.len();
-                                for path in paths {
-                                    if let Err(e) = tokio::fs::remove_file(&path).await {
-                                        // NotFound is benign — cleaned up by a previous run.
-                                        tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
-                                    }
-                                }
-                                tracing::info!(deleted, seq, "WAL segments cleaned up");
-                            }
-                            Err(e) => tracing::error!(error = %e, "WAL checkpoint failed"),
-                        }
-                    }
-                    Err(e) => {
-                        metrics::memtable_flush_total()
-                            .with_label_values(&["error"])
-                            .inc();
-                        tracing::error!(error = %e, "flush failed");
-                    }
-                }
-            });
-        } else {
-            drop(mem); // release lock when no flush needed
+        let mut j = 0;
+        while j < indexed.len() {
+            let shard = indexed[j].0;
+            let end = indexed[j..].partition_point(|(s, _)| *s == shard) + j;
+            let mut mem = self.memtables[shard].lock().await;
+            for &(_, idx) in &indexed[j..end] {
+                mem.insert(pts[idx].clone());
+            }
+            // shard lock released here
+            j = end;
         }
 
         Ok(Response::new(AppendResponse { sequence: seq }))
@@ -294,31 +256,32 @@ impl StorageService for StorageServer {
         // stream handle; results are sent incrementally as they are read.
         let (tx, rx) = tokio::sync::mpsc::channel(256);
         let index = Arc::clone(&self.index);
-        let memtable = Arc::clone(&self.memtable);
+        let memtables: Vec<Arc<Mutex<Memtable>>> = self.memtables.iter().map(Arc::clone).collect();
         tokio::spawn(async move {
             let query_start = std::time::Instant::now();
             // ── Stage 1: Memtable scan ────────────────────────────────────────
-            // Collect all matching points under the memtable lock, then release
-            // it before streaming — the lock must not be held across channel
-            // sends, which can block when the receiver is slow.
-            let mem_response: Vec<QueryResponse> = {
-                let mem = memtable.lock().await;
+            // Tag filters may match series across multiple shards — fan out to
+            // all shards. Each shard lock is acquired and released individually;
+            // results are collected before streaming to avoid holding any lock
+            // across channel sends, which can block when the receiver is slow.
+            let mut mem_response: Vec<QueryResponse> = Vec::new();
+            for shard in &memtables {
+                let mem = shard.lock().await;
                 let series = mem.resolve_series(&query.metric_name, &query.tags);
-                let mut responses = Vec::new();
                 for series_key in series {
                     let points =
                         mem.read_series(&series_key, query.time_start_ns, query.time_end_ns, None);
                     let series_id = SeriesId::from(&series_key);
                     for point in points {
-                        responses.push(QueryResponse {
+                        mem_response.push(QueryResponse {
                             series_id,
                             timestamp_ns: point.timestamp_ns,
                             value: point.value,
-                        })
+                        });
                     }
                 }
-                responses
-            }; // memtable lock released here
+                // shard lock released here before moving to the next shard
+            }
 
             tracing::debug!(points = mem_response.len(), "memtable scan complete");
 
@@ -473,5 +436,198 @@ impl StorageService for StorageServer {
         Ok(Response::new(SnapshotResponse {
             snapshot_path: self.snapshot_path.to_string_lossy().into_owned(),
         }))
+    }
+}
+
+impl StorageServer {
+    /// Spawns all background Tokio tasks. Must be called after `open()` and before
+    /// the server is moved into tonic. All tasks share state via Arc handles cloned
+    /// from `self` fields.
+    ///
+    /// ```text
+    ///  ┌─────────────────────────────────────────────────────────────────────┐
+    ///  │  tokio runtime                                                      │
+    ///  │                                                                     │
+    ///  │  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────┐ │
+    ///  │  │ WAL group commit│  │ Compaction task │  │   Snapshot task      │ │
+    ///  │  │   continuous    │  │  every N secs   │  │   every 60 secs      │ │
+    ///  │  │  WalSender ch.  │  │ Mutex<Compact>  │  │ RwLock<ChunkIdx>read │ │
+    ///  │  └────────┬────────┘  └────────┬────────┘  └──────────┬───────────┘ │
+    ///  │           │                    │                      │             │
+    ///  │  ┌────────┴────────────────────┴──────────────────────┴───────────┐ │
+    ///  │  │              Arc shared state                                  │ │
+    ///  │  │  WalSender · Vec<Arc<Mutex<Memtable>>> · Arc<RwLock<ChunkIdx>> │ │
+    ///  │  │  Arc<ChunkWriter> · Vec<Arc<AtomicU64>> (shard watermarks)     │ │
+    ///  │  └────────────────────────────────────────────────────────────────┘ │
+    ///  │           │                                                         │
+    ///  │  ┌────────┴───────────────────────────────────────────────────────┐ │
+    ///  │  │  Memtable sweep + WAL GC  (every 200ms)                        │ │
+    ///  │  │  for each shard: drain → ChunkWriter → Index write → watermark │ │
+    ///  │  │  then: min(watermarks) → WalSender::drain_completed_before     │ │
+    ///  │  └────────────────────────────────────────────────────────────────┘ │
+    ///  │           │                                                         │
+    ///  │  ┌────────┴───────────────────────────────────────────────────────┐ │
+    ///  │  │  gRPC server (tonic) — one task per incoming RPC               │ │
+    ///  │  │  Append | Query | Compact | Snapshot                           │ │
+    ///  │  └────────────────────────────────────────────────────────────────┘ │
+    ///  └─────────────────────────────────────────────────────────────────────┘
+    /// ```
+    ///
+    /// Lock acquisition order (never hold two simultaneously unless noted):
+    ///   WAL channel send → oneshot wait → Memtable Mutex[i] → released
+    ///   → ChunkWriter (no lock) → Index RwLock write → released
+    ///   → WAL channel send (DrainBefore)
+    ///   Query path: Index RwLock read → released before any disk I/O
+    pub fn spawn_background_tasks(&self, config: &StorageConfig) {
+        // Size-tiered compaction — runs every compaction_interval_secs.
+        // The Mutex is acquired only for each compact_once() call and released
+        // immediately after, so the gRPC Compact handler can interject between cycles.
+        let bg_worker = Arc::clone(&self.compaction_worker);
+        let compaction_interval_secs = config.compaction_interval_secs;
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(compaction_interval_secs));
+            loop {
+                ticker.tick().await;
+                let w = bg_worker.lock().await;
+                if let Err(e) = w.compact_once().await {
+                    tracing::error!(error = %e, "background compaction failed");
+                }
+                // MutexGuard dropped here — lock released before next tick
+            }
+        });
+
+        // Periodic index snapshot — saves every 60 seconds.
+        // WAL sequence is read first (lock acquired + released at semicolon, no binding),
+        // then the index read lock is acquired for serialisation. Two locks are never
+        // held simultaneously, avoiding contention with the flush write path.
+        {
+            let idx_clone = Arc::clone(&self.index);
+            let wal_clone = self.wal.clone();
+            let index_path = self.snapshot_path.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                loop {
+                    ticker.tick().await;
+                    // Temporary guard — WAL lock released at the semicolon
+                    let seq = wal_clone.current_sequence();
+                    let index = idx_clone.read().await;
+                    if let Err(e) = index::persistence::save_index(&index, &index_path, seq).await {
+                        tracing::error!(error = %e, "periodic index snapshot failed");
+                    }
+                    // index read lock released here (RwLockReadGuard dropped)
+                }
+            });
+        }
+
+        // Periodic memtable sweep
+        {
+            let memtables: Vec<Arc<Mutex<Memtable>>> =
+                self.memtables.iter().map(|m| Arc::clone(m)).collect();
+            let chunk_writer = Arc::clone(&self.chunk_writer);
+            let index = Arc::clone(&self.index);
+            let wal = self.wal.clone();
+            let watermarks: Vec<Arc<AtomicU64>> = self
+                .mem_shard_watermarks
+                .iter()
+                .map(|w| Arc::clone(w))
+                .collect();
+
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(Duration::from_millis(200));
+                loop {
+                    ticker.tick().await;
+                    let mut total_memtable_bytes: usize = 0;
+
+                    for (i, mem) in memtables.iter().enumerate() {
+                        let mut mem = mem.lock().await;
+                        // Accumulate size while the lock is held — avoids a second
+                        // lock acquisition pass just for the metric.
+                        total_memtable_bytes += mem.size_bytes();
+
+                        if mem.should_flush() {
+                            let drained = mem.drain();
+                            drop(mem); // release shard lock before disk I/O
+                            // Transient visibility gap: between drain() and index.register()
+                            // below, flushed points are neither in the memtable nor in the
+                            // chunk index. Queries arriving mid-flush may return fewer results
+                            // than expected — this is an architectural trade-off, not a bug.
+                            // WAL durability guarantees no data loss on crash.
+
+                            let flush_start = std::time::Instant::now();
+                            match chunk_writer.write(drained).await {
+                                Ok(result) => {
+                                    // Register all series under a single write lock
+                                    // acquisition — atomic from the query path's view.
+                                    let mut index = index.write().await;
+                                    for s in &result.series_results {
+                                        index.register(
+                                            &s.series_key,
+                                            s.entry.clone(),
+                                            s.stats.clone(),
+                                            result.chunk_meta.clone(),
+                                        );
+                                    }
+                                    metrics::chunk_files_total()
+                                        .set(index.chunk_file_count() as i64);
+                                    metrics::index_series_count()
+                                        .set(index.series_count() as i64);
+                                    drop(index);
+
+                                    metrics::chunk_bytes_written_total()
+                                        .inc_by(result.chunk_meta.file_size);
+                                    metrics::memtable_flush_duration_seconds()
+                                        .observe(flush_start.elapsed().as_secs_f64());
+                                    metrics::memtable_flush_total()
+                                        .with_label_values(&["ok"])
+                                        .inc();
+                                    tracing::info!(
+                                        shard   = i,
+                                        series  = result.series_results.len(),
+                                        chunk   = ?result.chunk_meta.file_path,
+                                        "memtable flushed"
+                                    );
+
+                                    let seq = wal.current_sequence();
+                                    watermarks[i].store(seq, Ordering::Release);
+                                }
+                                Err(e) => {
+                                    metrics::memtable_flush_total()
+                                        .with_label_values(&["error"])
+                                        .inc();
+                                    tracing::error!(shard = i, error = %e, "flush failed");
+                                }
+                            }
+                        }
+                    }
+
+                    metrics::memtable_size_bytes().set(total_memtable_bytes as i64);
+
+                    let safe_seq = watermarks
+                        .iter()
+                        .map(|w| w.load(Ordering::Acquire))
+                        .min()
+                        .unwrap_or(0);
+                    match wal.drain_completed_before(safe_seq).await {
+                        Ok(paths) => {
+                            let mut deleted = 0usize;
+                            for path in &paths {
+                                if let Err(e) = tokio::fs::remove_file(path).await {
+                                    // NotFound is benign — cleaned up by a previous run.
+                                    tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
+                                    continue;
+                                }
+                                deleted += 1;
+                            }
+                            if deleted == 0 && !paths.is_empty() {
+                                tracing::warn!(to_delete = paths.len(), "failed to clean up WAL segments");
+                            } else if deleted > 0 {
+                                tracing::info!(deleted, safe_seq, "WAL segments cleaned up");
+                            }
+                        }
+                        Err(e) => tracing::error!(error = %e, "WAL segment GC failed"),
+                    };
+                }
+            });
+        }
     }
 }

@@ -17,6 +17,10 @@ pub enum WalMessage {
     Rotate {
         reply: oneshot::Sender<Result<Vec<PathBuf>>>,
     },
+    DrainBefore {
+        seq: Sequence,
+        reply: oneshot::Sender<Result<Vec<PathBuf>>>,
+    },
 }
 
 #[derive(Clone)]
@@ -46,6 +50,20 @@ impl WalSender {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(WalMessage::Rotate { reply: reply_tx })
+            .await
+            .map_err(|_| anyhow::anyhow!("WAL task shut down"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("WAL task dropped reply"))?
+    }
+
+    pub async fn drain_completed_before(&self, seq: Sequence) -> Result<Vec<PathBuf>> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.tx
+            .send(WalMessage::DrainBefore {
+                seq,
+                reply: reply_tx,
+            })
             .await
             .map_err(|_| anyhow::anyhow!("WAL task shut down"))?;
         reply_rx
@@ -93,6 +111,7 @@ async fn wal_task(
         let mut frames: Vec<u8> = Vec::new();
         let mut seqs: Vec<Sequence> = Vec::new();
         let mut rotate_reply: Option<oneshot::Sender<Result<Vec<PathBuf>>>> = None;
+        let mut drain_replies: Vec<(Sequence, oneshot::Sender<Result<Vec<PathBuf>>>)> = Vec::new();
 
         // gather all Append into batch, and keep at most one Rotate
         for msg in batch {
@@ -113,6 +132,9 @@ async fn wal_task(
                     } else {
                         let _ = reply.send(Err(anyhow::anyhow!("concurrent Rotate in same batch")));
                     }
+                }
+                WalMessage::DrainBefore { seq, reply } => {
+                    drain_replies.push((seq, reply));
                 }
             }
         }
@@ -144,6 +166,15 @@ async fn wal_task(
                     tracing::error!(error = %e, "WAL segment rotation failed");
                 }
 
+                // handle explicit periodic sweep request
+                if !drain_replies.is_empty() {
+                    let max_seq = drain_replies.iter().map(|(seq, _)| *seq).max().unwrap();
+                    let paths = writer.drain_completed_before(max_seq);
+                    for (_, reply) in drain_replies {
+                        let _ = reply.send(Ok(paths.clone()));
+                    }
+                }
+
                 // handle explicit Rotate request
                 if let Some(rotate) = rotate_reply {
                     let result = writer
@@ -159,7 +190,9 @@ async fn wal_task(
                 for reply in replies {
                     let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
                 }
-                // Also fail the checkpoint caller
+                for (_, reply) in drain_replies {
+                    let _ = reply.send(Err(anyhow::anyhow!("WAL write failed: {}", msg)));
+                }
                 if let Some(rotate) = rotate_reply {
                     let _ = rotate.send(Err(anyhow::anyhow!("WAL write failed: {}", msg)));
                 }

@@ -31,6 +31,9 @@ pub struct StorageConfig {
     /// Larger threshold = fewer chunk files but more memory usage
     pub memtable_flush_threshold_bytes: usize,
 
+    /// Memtable shards number
+    pub memtable_shards: usize,
+
     /// Compaction runs every this many seconds (default 300)
     pub compaction_interval_secs: u64,
 
@@ -49,6 +52,11 @@ pub struct StorageConfig {
 
 impl StorageConfig {
     pub fn load() -> Result<Self> {
+        let memtable_shards = env_usize("MICIUS_MEMTABLE_SHARDS", 16);
+        anyhow::ensure!(
+            memtable_shards >= 1 && memtable_shards.is_power_of_two(),
+            "MICIUS_MEMTABLE_SHARDS must be a power of 2 >= 1, got {memtable_shards}"
+        );
         Ok(Self {
             wal_dir: env_path("MICIUS_WAL_DIR", "/var/micius/data/wal"),
             chunk_dir: env_path("MICIUS_CHUNK_DIR", "/var/micius/data/chunks"),
@@ -57,6 +65,7 @@ impl StorageConfig {
             wal_channel_capacity: env_usize("MICIUS_WAL_CHANNEL_CAPACITY", 1024),
             wal_max_batch: env_usize("MICIUS_WAL_MAX_BATCH", 256),
             memtable_flush_threshold_bytes: env_usize("MICIUS_MEMTABLE_FLUSH_MB", 32) * 1024 * 1024,
+            memtable_shards,
             compaction_interval_secs: env_u64("MICIUS_COMPACTION_INTERVAL_SECS", 300),
             compaction_min_threshold: env_usize("MICIUS_COMPACTION_MIN_THRESHOLD", 4),
             compaction_size_ratio: env_f64("MICIUS_COMPACTION_SIZE_RATIO", 1.5),
