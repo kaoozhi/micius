@@ -111,7 +111,7 @@ micius/
 │   │   ├── wal/
 │   │   │   ├── mod.rs
 │   │   │   ├── writer.rs              # append + fsync + segment rotation
-│   │   │   ├── group_commit.rs        # WalSender — channel-based batching, one fsync per batch
+│   │   │   ├── group_commit.rs        # WalSender — channel-based batching, one fsync per batch, DrainBefore for per-shard GC
 │   │   │   ├── proto.rs               # WalEntry, WalDataPoint prost structs
 │   │   │   └── recovery.rs            # CRC32 replay on startup, torn-write detection
 │   │   ├── memtable/
@@ -233,6 +233,7 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 - [x] WAL writer (append + fsync + segment rotation)
 - [x] WAL recovery (replay on startup, torn-write detection)
 - [x] WAL group commit (WalSender — channel batching, one fsync per N concurrent writers)
+- [x] WAL sharding (16 shards, shard-{i}/ dirs, parallel fsyncs, per-shard recovery and GC)
 - [x] Memtable (BTreeMap, flush threshold)
 - [x] Memtable sharding (16 shards, xxh64 bitmask routing, periodic sweep, WAL watermarks)
 - [x] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
@@ -269,7 +270,7 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 ### Known gaps / open questions
 - Compaction strategy: size-tiered chosen — leveled TBD for later phase
 - Bloom filter false positive rate: not yet tuned (default 1%)
-- Memtable sharding ceiling (~2,600 req/s) is now hardware-bound (APFS fsync ~4.5ms) — further improvement requires faster storage or WAL sharding
+- WAL + memtable sharding ceiling (~3,400 req/s on APFS) is hardware-bound — Linux NVMe with truly independent devices per shard would approach linear scaling
 - slog adapter field extractor config format: not yet finalized
 
 ---
@@ -462,7 +463,9 @@ These decisions are settled. Do not revisit without strong justification.
 
 **WAL group commit**: concurrent Append RPCs enqueue frames on an `mpsc` channel and await a `oneshot` reply. A single `wal_task` drains the backlog with `try_recv()`, writes all frames in one `write_all`, calls `sync_all()` once, then replies to all waiters. Batch size emerges from fsync latency × arrival rate — no artificial delay. Benchmark: 5.9× throughput at 100 workers vs the Mutex design (23k → 141k pts/s on macOS Intel).
 
-**Memtable sharding (16 shards)**: each write is routed to `shard = hash(series_key) & (N-1)` — xxh64 over `"metric_name,k1=v1,k2=v2"` (BTreeMap-sorted tags), bitmask instead of modulo (N must be a power of 2). Each shard has its own `Mutex<Memtable>` so concurrent writers on different series never contend. Flush is decoupled from the RPC handler: a 200ms periodic sweep scans shards sequentially, drains any exceeding their per-shard threshold, and advances a per-shard watermark. WAL segments are only deleted when `min(all watermarks)` covers them — prevents data loss if a shard has not yet flushed. Benchmark: 10.9× throughput vs the original Mutex baseline (23k → 260k pts/s). Ceiling is now hardware-bound (~2,600 req/s, set by APFS fsync latency).
+**WAL sharding (16 shards)**: each shard writes to `wal_dir/shard-{i}/` — an independent WalWriter and wal_task per shard. The append handler routes points to their shard, spawns one Tokio task per shard for parallel WAL appends, then joins all handles before memtable inserts. Total WAL wait = max(shard latencies) not sum. Per-shard recovery on startup (each shard replays its own directory independently). WAL GC is per-shard: after flush, `wals[i].drain_completed_before(seq)` runs immediately without waiting for other shards. Benchmark: +31% throughput on APFS (260k → 341k pts/s at 300 workers) — parallel fsync across independent subdirectories provides partial APFS-level parallelism.
+
+**Memtable sharding (16 shards)**: each write is routed to `shard = hash(series_key) & (N-1)` — xxh64 over `"metric_name,k1=v1,k2=v2"` (BTreeMap-sorted tags), bitmask instead of modulo (N must be a power of 2). Each shard has its own `Mutex<Memtable>` so concurrent writers on different series never contend. Flush is decoupled from the RPC handler: a 200ms periodic sweep scans shards sequentially, drains any exceeding their per-shard threshold, and advances a per-shard watermark. Benchmark: 10.9× throughput vs the original Mutex baseline (23k → 260k pts/s).
 
 **WAL entry format**: length-prefix + CRC32 checksum + protobuf payload. Length prefix enables forward scanning during recovery. CRC32 detects torn writes — recovery stops at first checksum mismatch, does not attempt to skip and continue.
 

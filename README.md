@@ -7,7 +7,7 @@
 ![Rust](https://img.shields.io/badge/rust-1.91%2B-orange)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
-Micius covers the full observability stack: multi-source metrics ingestion (DogStatsD, Prometheus, Alpaca WebSocket, slog), a **custom Rust storage engine** exposed over gRPC, and a Go query layer with aggregation, alerting, and transactional webhook delivery. The storage engine is the foundation — built from scratch with a group-commit WAL (one fsync per N concurrent writers), a 16-shard BTreeMap memtable, columnar chunk files (delta-encoding + lz4 + bloom filters), an inverted tag index, and size-tiered compaction. It sustains **260k+ points/sec** durable writes (fsync before ack) at 100k-series cardinality on an Intel Mac (macOS/APFS).
+Micius covers the full observability stack: multi-source metrics ingestion (DogStatsD, Prometheus, Alpaca WebSocket, slog), a **custom Rust storage engine** exposed over gRPC, and a Go query layer with aggregation, alerting, and transactional webhook delivery. The storage engine is the foundation — built from scratch with a 16-shard group-commit WAL (parallel fsyncs per shard, one per N concurrent writers), a 16-shard BTreeMap memtable, columnar chunk files (delta-encoding + lz4 + bloom filters), an inverted tag index, and size-tiered compaction. It sustains **340k+ points/sec** durable writes (fsync before ack) at 100k-series cardinality on macOS/APFS, and **520k+ points/sec** on Linux NVMe ext4 (AMD EPYC) where the ceiling shifts from storage to CPU.
 
 ---
 
@@ -43,7 +43,7 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
   ┌──────── Startup Recovery  (runs once · gates all traffic) ─────────────────┐
   │                                                                            │
   │  1. load index snapshot  ──► ChunkIndex  (or empty on first start)         │
-  │  2. WAL replay  ──► CRC32 per frame  ──► stop at first torn write          │
+  │  2. WAL replay  (16 shards · CRC32 per frame · stop at first torn write)   │
   │  3. flush recovered points  ──► .mcs chunk  ──► ChunkIndex.register()      │
   │  4. WAL.rotate() + drain_completed(u64::MAX)  ──► delete replayed segments │
   │  5. open WAL writer  (resume_seq = recovery.last_sequence)                 │
@@ -52,17 +52,26 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
   │                                                                            │
   └────────────────────────────────────────────────────────────────────────────┘
 
-  ┌──────── Write Path ────────────────────────────────────────────────────────┐
+  ┌──────── Write Path (Fan-out / Fan-in) ─────────────────────────────────────┐
   │                                                                            │
-  │  gRPC Append                                                               │
-  │      │                                                                     │
-  │      ▼                                                                     │
-  │  WAL channel ── batch write_all + fsync once ──► segment file (CRC32/frame)│
-  │      │                                                                     │
-  │      ▼                                                                     │
-  │  memtables[hash(series_key) & (N-1)].insert()  (16 shards · BTreeMap)     │
-  │      │  flush decisions off the hot path — handled by periodic sweep       │
-  │      └─ return Ok to caller                                                │
+  │  gRPC Append  (diverse series)                                             │
+  │       │                                                                    │
+  │       │  group by shard = hash(series_key) & 15                            │
+  │       │          ↓ FAN-OUT — spawn one Tokio task per shard hit            │
+  │       ├──► shard 0  ── write_all + fsync ──► wal/shard-0/  ─┐              │
+  │       ├──► shard 5  ── write_all + fsync ──► wal/shard-5/  ─┤              │
+  │       ├──► shard 9  ── write_all + fsync ──► wal/shard-9/  ─┤              │
+  │       └──► shard 14 ── write_all + fsync ──► wal/shard-14/ ─┘              │
+  │                  ↓ FAN-IN — join_all                                       │
+  │       total wait = max(T_fsync[i]),  not  sum(T_fsync[i])                  │
+  │       │                                                                    │
+  │       ├─► memtables[0].insert()  ─┐                                        │
+  │       ├─► memtables[5].insert()   ├─ sequential · one Mutex per shard      │
+  │       ├─► memtables[9].insert()   │                                        │
+  │       └─► memtables[14].insert() ─┘                                        │
+  │       │   flush decisions off the hot path — handled by periodic sweep     │
+  │       │                                                                    │
+  │       └─ return Ok  (fsync already on disk · durable)                      │
   │                                                                            │
   └────────────────────────────────────────────────────────────────────────────┘
 
@@ -81,12 +90,12 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
 
   ┌──────── Background Tasks ──────────────────────────────────────────────────┐
   │                                                                            │
-  │  WAL group commit task  (continuous · spawned once at startup)             │
+  │  16 WAL group commit tasks  (one per shard · spawned at startup)           │
   │      ├─ recv().await  park until first message arrives                     │
   │      ├─ try_recv() drain  collect backlog up to max_batch (non-blocking)   │
-  │      ├─ write_all + sync_all  one fsync for the entire batch               │
+  │      ├─ write_all + sync_all  one fsync for the entire shard batch         │
   │      ├─ last_seq.store(Ordering::Release)  publish watermark atomically    │
-  │      └─ oneshot replies  unblock all waiting Append RPCs                   │
+  │      └─ oneshot replies  unblock all waiting Append RPCs for this shard    │
   │                                                                            │
   │  Compaction worker  (every N secs, Mutex released between cycles)          │
   │      compact_once()                                                        │
@@ -100,7 +109,7 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
   │      ├─ ChunkWriter.write()  →  .mcs file  (δ-encode · lz4 · bloom)        │
   │      ├─ ChunkIndex.register()  (under write lock, no disk I/O held)        │
   │      ├─ watermark[i].store(wal.current_sequence(), Release)                │
-  │      └─ WAL.drain_completed_before(min(watermarks))  → delete stale segs   │
+  │      └─ wals[i].drain_completed_before(watermarks[i])  → delete shard segs│
   │                                                                            │
   │  Snapshot worker  (every 60s)                                              │
   │      WAL.current_sequence()  +  ChunkIndex  ──► bincode  ──► index.bin     │
@@ -113,19 +122,21 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
 
 ## Performance
 
-**Platform:** macOS host (Intel) · 100,000-series cardinality · 100 points/request
+**Batch size:** 100 points/request · **Series cardinality:** 100,000 unique series · **29.5× throughput increase baseline → peak**
 
-| Concurrency | Strategy                    | **pts/s**   | req/s | P50   | P99    |
-| ----------- | --------------------------- | ----------- | ----- | ----- | ------ |
-| 1 worker    | WAL Mutex (baseline)        | **17,700**  | 177   | 4.4ms | 20.9ms |
-| 100 workers | WAL Mutex (baseline)        | **23,873**  | 239   | 414ms | 604ms  |
-| 100 workers | + WAL group commit          | **141,380** | 1,414 | 69ms  | 124ms  |
-| 100 workers | + WAL group commit + shards | **203,126** | 2,031 | 46ms  | 101ms  |
-| 300 workers | + WAL group commit + shards | **259,767** | 2,598 | 113ms | 186ms  |
+Each optimisation removes one serialisation point and exposes the next bottleneck:
 
-Each optimisation removes one bottleneck: WAL group commit eliminates fsync serialisation (**5.9×**); 16-shard memtable eliminates lock contention (**10.9× vs baseline** at 100 workers, **259k pts/s** at 300 workers). The ceiling is hardware-bound — set by fsync latency, not software.
+| Milestone                            | **pts/s**   | req/s | Bottleneck removed                 |
+| ------------------------------------ | ----------- | ----- | ---------------------------------- |
+| WAL Mutex baseline (macOS APFS)      | **17,700**  | 177   | —                                  |
+| + Group commit                       | **141,380** | 1,414 | WAL fsync serialisation (5.9×)     |
+| + 16-shard memtable                  | **203,126** | 2,031 | Memtable Mutex contention (10.9×)  |
+| + 16-shard WAL, parallel fsyncs      | **341,099** | 3,411 | Single WAL fsync queue (+31%)      |
+| + NVMe ext4 + 500µs delay (AMD EPYC) | **522,852** | 5,229 | Storage → CPU-bound ceiling (+53%) |
 
-See [`docs/benchmarks.md`](docs/benchmarks.md) for full results including EC2 c5.large analysis and bottleneck decomposition.
+On bare-metal Linux NVMe ext4 the engine reaches its current ceiling with storage no longer the constraint: 86% CPU utilisation, 0.86% iowait, NVMe at 40% capacity. The 500µs batch delay (D ≈ 0.36 × T_fsync) extends the natural batch window for +16% throughput — and counterintuitively lowers P50, since higher throughput drains the queue faster than 500µs adds.
+
+See [`docs/benchmarks.md`](docs/benchmarks.md) for the full analysis: per-platform tables, iostat breakdown, batch delay tuning, and future architectural directions (io_uring, slab allocation, lock-free memtable).
 
 ---
 
@@ -136,7 +147,7 @@ See [`docs/benchmarks.md`](docs/benchmarks.md) for full results including EC2 c5
 The WAL is lock-free on the write path — writers enqueue via channel and await a oneshot reply; no Mutex is held. The memtable is partitioned into 16 shards, each with its own Mutex; at most one shard lock is held at a time, acquired in ascending index order. The engine enforces a strict acquisition order across **all** code paths:
 
 ```
-Write path:  WAL channel send (no lock) → Memtable[i] Mutex → released
+Write path:  N parallel WAL channel sends (no lock · tokio tasks) → join → Memtable[i] Mutex → released
 Sweep path:  Memtable[i] Mutex (drain) → released → Index RwLock write → released → WAL channel send
 Query path:  Memtable[i] Mutex → released (per shard) → Index RwLock read → released before disk I/O
 Snapshot:    Index RwLock read  (WAL sequence is AtomicU64 — no lock needed)
@@ -171,6 +182,26 @@ After   100 workers × 16 shards   →  203k pts/s  P50  46ms  (2,031 req/s)  (1
 ```
 
 The ceiling is now `batch_size / fsync_latency` — a hardware limit, not a software one.
+
+### 16-shard WAL — parallel fsyncs, total wait = max(shard latencies)
+
+Memtable sharding shifted the bottleneck back to the WAL: with a single WAL file, all batches still serialise through one fsync queue, capping throughput at `batch_size / T_fsync`. Sharding the WAL breaks this — sixteen independent segment directories (`wal/shard-{i}/`), each with its own `wal_task` and fsync running concurrently.
+
+The append handler groups each point by series hash, spawns one Tokio task per affected shard, and joins all handles before inserting into the memtable. Total WAL latency becomes `max(shard latencies)`, not `sum`:
+
+```
+single WAL:   all requests → 1 fsync queue         → ceiling = batch_size / T_fsync
+16-shard WAL: each request → ≤16 parallel fsyncs   → total wait = max(T_fsync[i])
+```
+
+Per-shard WAL GC is simpler than the single-WAL case: after each shard flush the sweep calls `wals[i].drain_completed_before(watermarks[i])` immediately — no global `min(watermarks)` synchronisation point needed.
+
+```
+Before  300 workers × single WAL   → 2,598 req/s → 260k pts/s  P50 113ms
+After   300 workers × 16-shard WAL → 3,411 req/s → 341k pts/s  P50  84ms  (+31%)
+```
+
+The benefit scales with `T_fsync / spawn_overhead`. On APFS (4.5ms) it yields +31%; on a RAM disk (1.3ms) spawn overhead dominates and the gain disappears. Linux NVMe with truly independent devices per shard would approach linear scaling.
 
 ### Durability before acknowledgement
 
@@ -207,6 +238,7 @@ Size-tiered compaction (over leveled) was chosen because the workload is write-h
 | 1     | Size-tiered compaction                                                | ✅      |
 | 1     | gRPC server — Append, Query (streaming), Compact, Snapshot            | ✅      |
 | 1     | WAL group commit — channel-based batching, one fsync per N writers    | ✅      |
+| 1     | 16-shard WAL — parallel fsyncs, per-shard recovery and GC             | ✅      |
 | 1     | 16-shard memtable — per-shard Mutex, periodic sweep, WAL watermarks   | ✅      |
 | 1     | Docker — multi-stage Dockerfile, docker-compose, Makefile             | ✅      |
 | 1     | CI — fmt · clippy · nextest · audit · Docker build + gRPC smoke test  | ✅      |
@@ -230,7 +262,6 @@ make down     # stop
 Send a test point:
 ```bash
 grpcurl -plaintext \
-  -import-path proto \
   -proto proto/storage/v1/storage.proto \
   -d '{"points":[{"metric_name":"cpu.load","tags":{"host":"web1"},"timestamp_ns":1000000000,"value":0.75}]}' \
   localhost:50051 \
