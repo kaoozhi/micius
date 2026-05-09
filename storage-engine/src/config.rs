@@ -27,6 +27,14 @@ pub struct StorageConfig {
     /// during disk stalls by capping how many callers share one failed fsync.
     pub wal_max_batch: usize,
 
+    /// Optional collect window before flushing a WAL batch (default 0 = disabled).
+    /// On fast storage (RAM disk, NVMe) the natural batch window is short and batch
+    /// sizes stay small. A non-zero delay lets more requests accumulate before fsync,
+    /// trading added latency for higher throughput. Tune to ~fsync_latency_us on the
+    /// target device. Leave at 0 on slow storage (APFS, EBS) where natural batching
+    /// already produces large batches.
+    pub wal_batch_delay_us: u64,
+
     /// Memtable flushes to disk after this many bytes (default 32 MB)
     /// Larger threshold = fewer chunk files but more memory usage
     pub memtable_flush_threshold_bytes: usize,
@@ -66,6 +74,7 @@ impl StorageConfig {
             wal_max_batch: env_usize("MICIUS_WAL_MAX_BATCH", 256),
             memtable_flush_threshold_bytes: env_usize("MICIUS_MEMTABLE_FLUSH_MB", 32) * 1024 * 1024,
             memtable_shards,
+            wal_batch_delay_us: env_u64("MICIUS_WAL_BATCH_DELAY_US", 0),
             compaction_interval_secs: env_u64("MICIUS_COMPACTION_INTERVAL_SECS", 300),
             compaction_min_threshold: env_usize("MICIUS_COMPACTION_MIN_THRESHOLD", 4),
             compaction_size_ratio: env_f64("MICIUS_COMPACTION_SIZE_RATIO", 1.5),

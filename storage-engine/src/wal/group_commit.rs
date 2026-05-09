@@ -71,10 +71,10 @@ impl WalSender {
             .map_err(|_| anyhow::anyhow!("WAL task dropped reply"))?
     }
 
-    pub fn spawn(writer: WalWriter, capacity: usize, max_batch: usize) -> Self {
+    pub fn spawn(writer: WalWriter, capacity: usize, max_batch: usize, batch_delay_us: u64) -> Self {
         let last_seq = Arc::new(AtomicU64::new(writer.current_seq));
         let (tx, rx) = mpsc::channel(capacity);
-        tokio::spawn(wal_task(rx, writer, max_batch, Arc::clone(&last_seq)));
+        tokio::spawn(wal_task(rx, writer, max_batch, batch_delay_us, Arc::clone(&last_seq)));
         Self { tx, last_seq }
     }
 
@@ -89,6 +89,7 @@ async fn wal_task(
     mut rx: mpsc::Receiver<WalMessage>,
     mut writer: WalWriter,
     max_batch: usize,
+    batch_delay_us: u64,
     last_seq: Arc<AtomicU64>,
 ) {
     loop {
@@ -99,7 +100,14 @@ async fn wal_task(
             None => return,
         }
 
-        // ── 2. Drain backlog non-blocking ──────────────────────────────────
+        // ── 2. Optional collect window ─────────────────────────────────────
+        // On fast storage the natural batch window is too short to accumulate
+        // many requests. A non-zero delay extends it at the cost of added latency.
+        if batch_delay_us > 0 {
+            tokio::time::sleep(tokio::time::Duration::from_micros(batch_delay_us)).await;
+        }
+
+        // ── 3. Drain backlog non-blocking ──────────────────────────────────
         while batch.len() < max_batch {
             match rx.try_recv() {
                 Ok(msg) => batch.push(msg),

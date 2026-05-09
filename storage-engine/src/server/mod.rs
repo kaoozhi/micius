@@ -119,6 +119,7 @@ impl StorageServer {
             wal_writer,
             config.wal_channel_capacity,
             config.wal_max_batch,
+            config.wal_batch_delay_us,
         );
         let index = Arc::new(RwLock::new(idx));
         let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));

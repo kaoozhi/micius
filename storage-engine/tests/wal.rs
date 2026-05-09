@@ -251,7 +251,7 @@ async fn test_drain_completed_before_boundary() {
 async fn test_group_commit_sequential_sequences() {
     let dir = tempdir().unwrap();
     let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
-    let wal = WalSender::spawn(writer, 128, 64);
+    let wal = WalSender::spawn(writer, 128, 64, 0);
 
     for expected in 1u64..=5 {
         let seq = wal.append(Arc::new(sample_points(3))).await.unwrap();
@@ -263,7 +263,7 @@ async fn test_group_commit_sequential_sequences() {
 async fn test_group_commit_current_sequence_tracks_committed() {
     let dir = tempdir().unwrap();
     let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
-    let wal = WalSender::spawn(writer, 128, 64);
+    let wal = WalSender::spawn(writer, 128, 64, 0);
 
     assert_eq!(wal.current_sequence(), 0, "no writes yet — must be 0");
 
@@ -285,7 +285,7 @@ async fn test_group_commit_concurrent_appends_unique_sequences() {
     let dir = tempdir().unwrap();
     let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
     // WalSender is Clone — each task gets its own handle to the same channel.
-    let wal = WalSender::spawn(writer, 256, 128);
+    let wal = WalSender::spawn(writer, 256, 128, 0);
     let barrier = Arc::new(tokio::sync::Barrier::new(N));
 
     let mut set = JoinSet::new();
@@ -315,7 +315,7 @@ async fn test_group_commit_concurrent_appends_unique_sequences() {
 async fn test_group_commit_data_is_recoverable() {
     let dir = tempdir().unwrap();
     let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
-    let wal = WalSender::spawn(writer, 128, 64);
+    let wal = WalSender::spawn(writer, 128, 64, 0);
 
     let batch_1 = sample_points(3);
     let batch_2 = sample_points(2);
@@ -334,7 +334,7 @@ async fn test_group_commit_data_is_recoverable() {
 async fn test_group_commit_rotate_and_drain_returns_segment() {
     let dir = tempdir().unwrap();
     let writer = WalWriter::open(dir.path(), 1024 * 1024, 0).await.unwrap();
-    let wal = WalSender::spawn(writer, 128, 64);
+    let wal = WalSender::spawn(writer, 128, 64, 0);
 
     wal.append(Arc::new(sample_points(5))).await.unwrap();
 
