@@ -24,7 +24,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 pub struct StorageServer {
-    pub wal: WalSender,
+    pub wals: Vec<WalSender>,
     pub memtables: Vec<Arc<Mutex<Memtable>>>,
     pub index: Arc<RwLock<ChunkIndex>>,
     pub chunk_writer: Arc<ChunkWriter>,
@@ -48,79 +48,79 @@ impl StorageServer {
     pub async fn open(config: &StorageConfig) -> anyhow::Result<Self> {
         // 1. Index snapshot ─────────────────────────────────────────────────
         // None = first run or missing snapshot → start from empty index.
-        let (mut idx, last_seq) = match index::persistence::load_index(&config.index_path).await? {
+        // shard recovers its own WAL independently using its own last_sequence.
+        let (mut idx, _) = match index::persistence::load_index(&config.index_path).await? {
             None => (ChunkIndex::new(), 0),
             Some((idx, seq)) => (idx, seq),
         };
         tracing::info!(
             series = idx.series_count(),
             chunks = idx.chunk_file_count(),
-            last_seq,
             "index snapshot loaded"
         );
 
-        // 2. WAL replay ─────────────────────────────────────────────────────
-        // Verifies CRC32 per frame, stops at first torn write.
-        // Returns only the points not yet flushed to chunk files.
-        let recovery = wal::recovery::recover(&config.wal_dir).await?;
-        tracing::info!(
-            points = recovery.points.len(),
-            segments = recovery.segments_replayed,
-            last_seq = recovery.last_sequence,
-            "WAL recovered"
-        );
+        // 2–4. Per-shard WAL recovery, flush, cleanup, and group commit spawn ─
+        // Each WAL shard lives in wal_dir/shard-{i}/. Recovery, segment cleanup,
+        // and task spawning are done independently per shard in the same loop.
+        // Watermarks are initialised to 0 — the first flush of each shard
+        // advances them, and WAL GC only runs after that.
+        let mut wals: Vec<WalSender> = Vec::with_capacity(config.memtable_shards);
+        for i in 0..config.memtable_shards {
+            let shard_dir = config.wal_dir.join(format!("shard-{:02}", i));
+            let recovery = wal::recovery::recover(&shard_dir).await?;
+            tracing::info!(
+                shard = i,
+                points = recovery.points.len(),
+                "WAL shard recovered"
+            );
 
-        // 3. Flush recovered points ─────────────────────────────────────────
-        // Bypass the size threshold — on open we always flush to a clean slate.
-        let mut memtable = Memtable::new(config.memtable_flush_threshold_bytes);
-        if !recovery.points.is_empty() {
-            for point in recovery.points {
-                memtable.insert(point);
+            if !recovery.points.is_empty() {
+                let mut memtable = Memtable::new(config.memtable_flush_threshold_bytes);
+                for point in recovery.points {
+                    memtable.insert(point);
+                }
+                let results = ChunkWriter::new(&config.chunk_dir)
+                    .write(memtable.drain())
+                    .await?;
+                let meta = results.chunk_meta;
+                for s in results.series_results {
+                    idx.register(&s.series_key, s.entry, s.stats, meta.clone());
+                }
+                tracing::info!(shard = i, chunk = ?meta.file_path, "recovery chunk written");
             }
-            let results = ChunkWriter::new(&config.chunk_dir)
-                .write(memtable.drain())
-                .await?;
-            let meta = results.chunk_meta;
-            for s in results.series_results {
-                idx.register(&s.series_key, s.entry, s.stats, meta.clone());
+
+            let mut writer = WalWriter::open(
+                &shard_dir,
+                config.wal_max_segment_bytes,
+                recovery.last_sequence,
+            )
+            .await?;
+            if recovery.segments_replayed > 0 {
+                writer.rotate().await?;
             }
-            tracing::info!(chunk = ?meta.file_path, "recovery chunk written");
-        }
-
-        // 4. WAL writer + segment cleanup ───────────────────────────────────
-        // Resume from recovery.last_sequence so new appends don't reuse
-        // already-assigned sequence numbers. u64::MAX covers all pre-existing
-        // completed segments — they were fully replayed above.
-        let mut wal_writer = WalWriter::open(
-            &config.wal_dir,
-            config.wal_max_segment_bytes,
-            recovery.last_sequence,
-        )
-        .await?;
-
-        if recovery.segments_replayed > 0 {
-            wal_writer.rotate().await?;
-        }
-        let to_delete = wal_writer.drain_completed_before(u64::MAX);
-        let mut deleted = 0usize;
-        for path in &to_delete {
-            if let Err(e) = tokio::fs::remove_file(path).await {
-                tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
-                continue;
+            let to_delete = writer.drain_completed_before(u64::MAX);
+            let mut deleted = 0usize;
+            for path in &to_delete {
+                if let Err(e) = tokio::fs::remove_file(path).await {
+                    tracing::warn!(shard = i, path = ?path, error = %e, "failed to delete WAL segment");
+                    continue;
+                }
+                deleted += 1;
             }
-            deleted += 1;
+            if deleted == 0 && !to_delete.is_empty() {
+                tracing::warn!(
+                    shard = i,
+                    to_delete = to_delete.len(),
+                    "failed to clean up segments"
+                );
+            }
+            wals.push(WalSender::spawn(
+                writer,
+                config.wal_channel_capacity,
+                config.wal_max_batch,
+                config.wal_batch_delay_us,
+            ));
         }
-        if deleted == 0 && !to_delete.is_empty() {
-            tracing::warn!(to_delete = to_delete.len(), "failed to clean up segments");
-        }
-
-        // 5. Spawn WAL group commit task ───────────────────────────────────
-        let wal = WalSender::spawn(
-            wal_writer,
-            config.wal_channel_capacity,
-            config.wal_max_batch,
-            config.wal_batch_delay_us,
-        );
         let index = Arc::new(RwLock::new(idx));
         let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));
 
@@ -137,12 +137,11 @@ impl StorageServer {
                 )))
             })
             .collect();
-        let initial_seq = wal.current_sequence();
         let watermarks: Vec<Arc<AtomicU64>> = (0..config.memtable_shards)
-            .map(|_| Arc::new(AtomicU64::new(initial_seq)))
+            .map(|_| Arc::new(AtomicU64::new(0u64)))
             .collect();
         Ok(Self {
-            wal,
+            wals,
             memtables,
             index,
             chunk_writer: writer,
@@ -159,9 +158,9 @@ impl StorageService for StorageServer {
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendResponse>, Status> {
-        // ── Step 1: decode proto DataPoints into internal types ──────────────
-        // tags arrive as HashMap from proto — collect into BTreeMap for
-        // canonical ordering required by SeriesKey hashing.
+        // ── Step 1: decode ───────────────────────────────────────────────────
+        // Tags arrive as HashMap from proto — collect into BTreeMap for
+        // canonical ordering required by SeriesKey hashing and shard routing.
         let points: Vec<DataPoint> = request
             .into_inner()
             .points
@@ -174,35 +173,9 @@ impl StorageService for StorageServer {
             })
             .collect();
 
-        // ── Step 2: WAL append (must complete before memtable insert) ─────────
-        // fsync happens inside append(). seq is the monotonic token returned
-        // to the caller and used later to bound WAL segment deletion.
-        let wal_start = std::time::Instant::now();
-
         let pts = Arc::new(points);
-        let seq = self.wal.append(Arc::clone(&pts)).await.map_err(|e| {
-            metrics::wal_entries_total()
-                .with_label_values(&["error"])
-                .inc();
-            Status::internal(format!("WAL error: {}", e))
-        })?;
-        metrics::wal_append_duration()
-            .with_label_values(&["ok"])
-            .observe(wal_start.elapsed().as_secs_f64());
-        metrics::wal_entries_total()
-            .with_label_values(&["ok"])
-            .inc();
-
-        tracing::info!(points = pts.len(), seq = seq, "append");
-
-        // ── Step 3: Memtable insert ───────────────────────────────────────────
-        // Route each point to its shard by hashing the series key, then acquire
-        // only the relevant shard locks. Flush decisions are handled by the
-        // periodic sweep task — this path returns immediately after WAL + insert.
-        // Sort point indices by shard so each shard lock is acquired exactly once.
-        // Allocates one Vec of length N instead of shards_num empty inner Vecs,
-        // which matters for small batches (single-point appends, low-volume paths).
         let shards_num = self.memtables.len();
+
         let mut indexed: Vec<(usize, usize)> = pts
             .iter()
             .enumerate()
@@ -210,19 +183,72 @@ impl StorageService for StorageServer {
             .collect();
         indexed.sort_unstable_by_key(|(shard, _)| *shard);
 
+        let wal_start = std::time::Instant::now();
+
+        // ── Step 2: Route points to shards ───────────────────────────────────
+        // Sort by shard index, then group consecutive entries — one Arc<Vec>
+        // per shard, used for both the WAL append and the memtable insert.
+        let mut shard_groups: Vec<(usize, Arc<Vec<DataPoint>>)> = Vec::new();
         let mut j = 0;
         while j < indexed.len() {
             let shard = indexed[j].0;
             let end = indexed[j..].partition_point(|(s, _)| *s == shard) + j;
-            let mut mem = self.memtables[shard].lock().await;
-            for &(_, idx) in &indexed[j..end] {
-                mem.insert(pts[idx].clone());
-            }
-            // shard lock released here
+            let shard_pts = Arc::new(
+                indexed[j..end]
+                    .iter()
+                    .map(|&(_, idx)| pts[idx].clone())
+                    .collect::<Vec<_>>(),
+            );
+            shard_groups.push((shard, shard_pts));
             j = end;
         }
 
-        Ok(Response::new(AppendResponse { sequence: seq }))
+        // ── Step 3: Parallel WAL appends ──────────────────────────────────────
+        // One Tokio task per shard so all fsyncs run concurrently.
+        // Total WAL wait = max(shard latencies), not sum — requires physically
+        // independent storage per shard to achieve linear scaling.
+        let handles: Vec<_> = shard_groups
+            .iter()
+            .map(|(shard, shard_pts)| {
+                let wal = self.wals[*shard].clone();
+                let pts = Arc::clone(shard_pts);
+                tokio::spawn(async move { wal.append(pts).await })
+            })
+            .collect();
+
+        let mut max_seq = 0u64;
+        for handle in handles {
+            let seq = handle
+                .await
+                .map_err(|_| Status::internal("WAL task panicked"))?
+                .map_err(|e| {
+                    metrics::wal_entries_total()
+                        .with_label_values(&["error"])
+                        .inc();
+                    Status::internal(format!("WAL error: {}", e))
+                })?;
+            max_seq = max_seq.max(seq);
+        }
+
+        // ── Step 4: Memtable inserts ──────────────────────────────────────────
+        // Sequential per shard — WAL fsync is complete for all shards before
+        // any insert happens, preserving the WAL-before-memtable invariant.
+        for (shard, shard_pts) in &shard_groups {
+            let mut mem = self.memtables[*shard].lock().await;
+            for point in shard_pts.iter() {
+                mem.insert(point.clone());
+            }
+        }
+
+        metrics::wal_append_duration()
+            .with_label_values(&["ok"])
+            .observe(wal_start.elapsed().as_secs_f64());
+        metrics::wal_entries_total()
+            .with_label_values(&["ok"])
+            .inc();
+
+        tracing::info!(points = pts.len(), seq = max_seq, "append");
+        Ok(Response::new(AppendResponse { sequence: max_seq }))
     }
 
     type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
@@ -426,7 +452,12 @@ impl StorageService for StorageServer {
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         tracing::info!("snapshot");
-        let seq = self.wal.current_sequence();
+        let seq = self
+            .mem_shard_watermarks
+            .iter()
+            .map(|w| w.load(Ordering::Acquire))
+            .max()
+            .unwrap_or(0);
         let index = self.index.read().await;
 
         crate::index::persistence::save_index(&index, &self.snapshot_path, seq)
@@ -503,14 +534,19 @@ impl StorageServer {
         // held simultaneously, avoiding contention with the flush write path.
         {
             let idx_clone = Arc::clone(&self.index);
-            let wal_clone = self.wal.clone();
+            let watermarks: Vec<Arc<AtomicU64>> =
+                self.mem_shard_watermarks.iter().map(Arc::clone).collect();
             let index_path = self.snapshot_path.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     ticker.tick().await;
-                    // Temporary guard — WAL lock released at the semicolon
-                    let seq = wal_clone.current_sequence();
+                    let seq = watermarks
+                        .iter()
+                        .map(|w| w.load(Ordering::Acquire))
+                        .max()
+                        .unwrap_or(0);
+
                     let index = idx_clone.read().await;
                     if let Err(e) = index::persistence::save_index(&index, &index_path, seq).await {
                         tracing::error!(error = %e, "periodic index snapshot failed");
@@ -523,15 +559,12 @@ impl StorageServer {
         // Periodic memtable sweep
         {
             let memtables: Vec<Arc<Mutex<Memtable>>> =
-                self.memtables.iter().map(|m| Arc::clone(m)).collect();
+                self.memtables.iter().map(Arc::clone).collect();
             let chunk_writer = Arc::clone(&self.chunk_writer);
             let index = Arc::clone(&self.index);
-            let wal = self.wal.clone();
-            let watermarks: Vec<Arc<AtomicU64>> = self
-                .mem_shard_watermarks
-                .iter()
-                .map(|w| Arc::clone(w))
-                .collect();
+            let wals: Vec<WalSender> = self.wals.clone();
+            let watermarks: Vec<Arc<AtomicU64>> =
+                self.mem_shard_watermarks.iter().map(Arc::clone).collect();
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(200));
@@ -570,8 +603,7 @@ impl StorageServer {
                                     }
                                     metrics::chunk_files_total()
                                         .set(index.chunk_file_count() as i64);
-                                    metrics::index_series_count()
-                                        .set(index.series_count() as i64);
+                                    metrics::index_series_count().set(index.series_count() as i64);
                                     drop(index);
 
                                     metrics::chunk_bytes_written_total()
@@ -588,8 +620,37 @@ impl StorageServer {
                                         "memtable flushed"
                                     );
 
-                                    let seq = wal.current_sequence();
+                                    let seq = wals[i].current_sequence();
                                     watermarks[i].store(seq, Ordering::Release);
+
+                                    match wals[i].drain_completed_before(seq).await {
+                                        Ok(paths) => {
+                                            let mut deleted = 0usize;
+                                            for path in &paths {
+                                                if let Err(e) = tokio::fs::remove_file(path).await {
+                                                    // NotFound is benign — cleaned up by a previous run.
+                                                    tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
+                                                    continue;
+                                                }
+                                                deleted += 1;
+                                            }
+                                            if deleted == 0 && !paths.is_empty() {
+                                                tracing::warn!(
+                                                    to_delete = paths.len(),
+                                                    "failed to clean up WAL segments"
+                                                );
+                                            } else if deleted > 0 {
+                                                tracing::info!(
+                                                    deleted,
+                                                    seq,
+                                                    "WAL segments cleaned up"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::error!(error = %e, "WAL segment GC failed")
+                                        }
+                                    };
                                 }
                                 Err(e) => {
                                     metrics::memtable_flush_total()
@@ -602,31 +663,6 @@ impl StorageServer {
                     }
 
                     metrics::memtable_size_bytes().set(total_memtable_bytes as i64);
-
-                    let safe_seq = watermarks
-                        .iter()
-                        .map(|w| w.load(Ordering::Acquire))
-                        .min()
-                        .unwrap_or(0);
-                    match wal.drain_completed_before(safe_seq).await {
-                        Ok(paths) => {
-                            let mut deleted = 0usize;
-                            for path in &paths {
-                                if let Err(e) = tokio::fs::remove_file(path).await {
-                                    // NotFound is benign — cleaned up by a previous run.
-                                    tracing::warn!(path = ?path, error = %e, "failed to delete WAL segment");
-                                    continue;
-                                }
-                                deleted += 1;
-                            }
-                            if deleted == 0 && !paths.is_empty() {
-                                tracing::warn!(to_delete = paths.len(), "failed to clean up WAL segments");
-                            } else if deleted > 0 {
-                                tracing::info!(deleted, safe_seq, "WAL segments cleaned up");
-                            }
-                        }
-                        Err(e) => tracing::error!(error = %e, "WAL segment GC failed"),
-                    };
                 }
             });
         }

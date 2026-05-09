@@ -71,10 +71,21 @@ impl WalSender {
             .map_err(|_| anyhow::anyhow!("WAL task dropped reply"))?
     }
 
-    pub fn spawn(writer: WalWriter, capacity: usize, max_batch: usize, batch_delay_us: u64) -> Self {
+    pub fn spawn(
+        writer: WalWriter,
+        capacity: usize,
+        max_batch: usize,
+        batch_delay_us: u64,
+    ) -> Self {
         let last_seq = Arc::new(AtomicU64::new(writer.current_seq));
         let (tx, rx) = mpsc::channel(capacity);
-        tokio::spawn(wal_task(rx, writer, max_batch, batch_delay_us, Arc::clone(&last_seq)));
+        tokio::spawn(wal_task(
+            rx,
+            writer,
+            max_batch,
+            batch_delay_us,
+            Arc::clone(&last_seq),
+        ));
         Self { tx, last_seq }
     }
 

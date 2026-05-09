@@ -85,8 +85,10 @@ impl StorageConfig {
 
     pub async fn ensure_dirs(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.wal_dir).await?;
+        for i in 0..self.memtable_shards {
+            tokio::fs::create_dir_all(self.wal_dir.join(format!("shard-{:02}", i))).await?;
+        }
         tokio::fs::create_dir_all(&self.chunk_dir).await?;
-        // index_path's parent directory
         if let Some(parent) = self.index_path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }

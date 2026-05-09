@@ -160,8 +160,11 @@ async fn test_data_survives_restart() {
     }
 }
 
-/// Concurrent appends from multiple tasks — exercises WAL Mutex and memtable
-/// Mutex under real concurrency. Verifies sequence uniqueness and no data loss.
+/// Concurrent appends from multiple tasks — exercises per-shard WAL and
+/// memtable locking under real concurrency. Verifies no data loss.
+/// Note: sequences are no longer globally unique — each WAL shard has its own
+/// sequence space, so two tasks writing to different shards can return the same
+/// sequence number. Data integrity (all points queryable) is the meaningful guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_appends_are_serialised() {
     let dir = tempdir().unwrap();
@@ -189,25 +192,12 @@ async fn test_concurrent_appends_are_serialised() {
             srv.append(Request::new(AppendRequest { points }))
                 .await
                 .expect("append failed")
-                .into_inner()
-                .sequence
         });
     }
 
-    let mut sequences: Vec<u64> = Vec::new();
     while let Some(result) = set.join_next().await {
-        sequences.push(result.expect("task panicked"));
+        result.expect("task panicked");
     }
-
-    // All sequences must be unique — WAL serialises appends
-    let mut sorted = sequences.clone();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(
-        sorted.len(),
-        n_tasks,
-        "every append must get a unique sequence"
-    );
 
     // All n_tasks * n_points points must be queryable
     let mut stream = server
