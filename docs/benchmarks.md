@@ -69,6 +69,55 @@ WAL ceiling = 11.7 / 0.0045  ≈ 2,600 req/s  ✓
 
 Memtable sharding eliminated the last software-level bottleneck — the ceiling is now set by storage hardware, not by lock contention.
 
+#### macOS RAM disk — WAL group commit + 16-shard memtable + batch delay tuning
+
+**Platform:** macOS host, Apple Intel · **Storage:** RAM disk (macOS `diskutil`) · **WAL fsync:** ~1.3ms
+
+The RAM disk isolates storage latency: same software stack, no flash I/O. Used to probe the
+WAL ceiling at lower fsync cost and motivate the `MICIUS_WAL_BATCH_DELAY_US` tuning parameter.
+
+**No batch delay:**
+
+| Workers | Throughput  | pts/s   | P50    | P90     | P99     |
+| ------- | ----------- | ------- | ------ | ------- | ------- |
+| 1       | 692 req/s   | 69,217  | 1.3ms  | 1.7ms   | 2.7ms   |
+| 100     | 3,059 req/s | 305,929 | 31.9ms | 38.2ms  | 69.3ms  |
+| 200     | 3,102 req/s | 310,208 | 63.3ms | 75.7ms  | 106.1ms |
+| 300     | 3,194 req/s | 319,404 | 92.3ms | 111.1ms | 141.7ms |
+
+Single-writer improves 3.6× over APFS (692 vs 193 req/s) — proportional to the fsync
+speedup. Multi-worker ceiling improves only 23% (3,194 vs 2,598 req/s) because faster fsync
+shortens the natural batch window, producing smaller batches:
+
+```
+batch_size = 3,194 × 0.0013 ≈ 4.2 req/batch  (vs 11.7 on APFS)
+WAL ceiling = 4.2 / 0.0013 ≈ 3,230 req/s  ✓
+```
+
+The WAL group commit ceiling is confirmed as the bottleneck regardless of storage speed.
+
+**With configurable batch delay (`MICIUS_WAL_BATCH_DELAY_US`):**
+
+A collect window before flushing extends the natural batch window on fast storage, trading
+added latency for larger batches. Counterintuitively, P50 improves alongside throughput
+because higher throughput reduces queuing time more than the delay adds.
+
+| Workers | Delay  | Throughput  | pts/s   | P50    | batch_size |
+| ------- | ------ | ----------- | ------- | ------ | ---------- |
+| 300     | 0µs    | 3,194 req/s | 319,404 | 92.3ms | ~4.2       |
+| 300     | 2000µs | 3,463 req/s | 346,278 | 85.4ms | ~11.4      |
+| 300     | 500µs  | 3,580 req/s | 358,045 | 82.6ms | ~6.4       |
+
+500µs outperforms 2000µs because `D < F` gives the best ratio: the cycle time grows by 38%
+while the batch window grows proportionally, yielding net throughput gain. With `D >> F`
+(2000µs vs 1.3ms fsync), denominator growth overtakes numerator growth.
+
+```
+Optimal delay rule:  D ≈ 0.3–0.5 × fsync_latency
+RAM disk (F=1.3ms):  D = 500µs  → 3,580 req/s  → 358k pts/s  (best)
+APFS     (F=4.5ms):  D = 0      → natural batching already produces large batches
+```
+
 #### EC2 c5.large — EBS gp3 (Linux, no Docker)
 
 **Platform:** AWS EC2 c5.large (2 vCPU, Intel), Ubuntu 24.04 · **WAL fsync:** ~4ms (EBS gp3)
@@ -102,6 +151,10 @@ Memtable ceiling ≈ 1 / 0.9ms ≈ 1,100 req/s
 
 Each optimisation shifts the bottleneck to the next layer. WAL group commit removed the
 single-fsync serialisation; 16-shard memtable partitioning removed per-request Mutex
-contention. The WAL group commit ceiling (~2,600 req/s) is now `batch_size / T_wal` —
-raising it further requires either faster storage (lower T_wal) or larger batches (more
-concurrent writers or an explicit batch collect window).
+contention. The WAL group commit ceiling is `batch_size / (delay + T_wal)` regardless of
+storage speed — confirmed on both APFS (4.5ms) and RAM disk (1.3ms). The `batch_delay`
+parameter extends the collect window on fast storage, trading latency for larger batches.
+
+The next architectural step to break past the single-WAL ceiling is WAL sharding: N
+independent WAL files, each with its own wal_task and fsync, eliminating cross-shard
+serialisation entirely.

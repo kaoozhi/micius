@@ -17,7 +17,7 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
 [UDP metrics]    ─┐
 [WebSocket feed] ─┤─► [Write Buffer] ─── gRPC Append ─────────────────┐
 [HTTP scrape]    ─┤    (Go ingestion)                                 │
-[TCP log stream] ─┘                                                   ▼
+[TCP log stream] ─┘                                                    ▼
                                                   ┌──────────────────────────────────┐
                                                   │  WAL  (group commit · CRC32)     │
                                                   │  Memtable  (16 shards · BTreeMap)│

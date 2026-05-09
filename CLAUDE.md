@@ -422,6 +422,7 @@ tracing::info!(
 | `MICIUS_WAL_MAX_SEGMENT_MB` | `4` | Rotate WAL segment after this many MB |
 | `MICIUS_WAL_CHANNEL_CAPACITY` | `2048` | Group commit channel buffer depth |
 | `MICIUS_WAL_MAX_BATCH` | `512` | Max requests batched per fsync |
+| `MICIUS_WAL_BATCH_DELAY_US` | `0` | Collect window before flushing batch (µs); tune to fsync latency on fast storage |
 | `MICIUS_CHUNK_DIR` | `/var/micius/data/chunks` | Chunk file directory |
 | `MICIUS_INDEX_PATH` | `/var/micius/data/index.bin` | Bincode snapshot path |
 | `MICIUS_MEMTABLE_FLUSH_MB` | `32` | Total memtable flush threshold (split evenly across shards) |
