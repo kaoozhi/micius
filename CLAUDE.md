@@ -111,10 +111,11 @@ micius/
 │   │   ├── wal/
 │   │   │   ├── mod.rs
 │   │   │   ├── writer.rs              # append + fsync + segment rotation
+│   │   │   ├── group_commit.rs        # WalSender — channel-based batching, one fsync per batch, DrainBefore for per-shard GC
 │   │   │   ├── proto.rs               # WalEntry, WalDataPoint prost structs
-│   │   │   └── recovery.rs            # replay on startup (not yet implemented)
+│   │   │   └── recovery.rs            # CRC32 replay on startup, torn-write detection
 │   │   ├── memtable/
-│   │   │   └── mod.rs                 # BTreeMap buffer, flush threshold
+│   │   │   └── mod.rs                 # 16-shard BTreeMap, shard_index (xxh64 bitmask), series_id_from_parts
 │   │   ├── chunk/
 │   │   │   ├── mod.rs
 │   │   │   ├── writer.rs              # columnar layout, delta encoding, lz4
@@ -126,15 +127,19 @@ micius/
 │   │   │   └── persistence.rs         # Index Persistence and Startup Recovery
 │   │   ├── compaction/
 │   │   │   └── mod.rs                 # size-tiered background worker
+│   │   ├── metrics.rs                 # Prometheus metrics (OnceLock pattern, axum /metrics)
 │   │   └── server/
-│   │       └── mod.rs                 # tonic gRPC server
+│   │       └── mod.rs                 # tonic gRPC server — Append, Query, Compact, Snapshot
 │   ├── tests/
-│   │   ├── chunkreader_test.rs        # chunk reader tests
-│   │   ├── chunkwriter_test.rs        # chunk writer tests
-│   │   ├── common
-│   │   │   └── mod.rs                 # helper functions
-│   │   ├── memtable_test.rs           # memtable tests
-│   │   └── wal_test.rs                # WAL integration tests
+│   │   ├── chunkreader.rs             # chunk reader tests
+│   │   ├── chunkwriter.rs             # chunk writer tests
+│   │   ├── compaction.rs              # compaction tests
+│   │   ├── index.rs                   # chunk index + tag index tests
+│   │   ├── memtable.rs                # memtable tests
+│   │   ├── server.rs                  # gRPC server integration tests
+│   │   ├── wal.rs                     # WAL + group commit integration tests
+│   │   └── common/
+│   │       └── mod.rs                 # shared test helpers
 │   ├── build.rs                       # prost-build code generation
 │   └── Cargo.toml
 ├── ingestion/                         # Go — adapters, write buffer, gRPC client
@@ -227,14 +232,19 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 ### Phase 1 progress
 - [x] WAL writer (append + fsync + segment rotation)
 - [x] WAL recovery (replay on startup, torn-write detection)
+- [x] WAL group commit (WalSender — channel batching, one fsync per N concurrent writers)
+- [x] WAL sharding (16 shards, shard-{i}/ dirs, parallel fsyncs, per-shard recovery and GC)
 - [x] Memtable (BTreeMap, flush threshold)
+- [x] Memtable sharding (16 shards, xxh64 bitmask routing, periodic sweep, WAL watermarks)
 - [x] Chunk writer (columnar layout, delta encoding, lz4, bloom filter)
 - [x] Chunk reader (decompress + decode)
 - [x] Chunk index (time-range pruning, stats-based predicate pushdown) + Tag inverted index (multi-tag intersection)
 - [x] Chunk index persistence (load index snapshot on restart, scan chunk not in snapshot, replay WAL)
-- [ ] Compaction worker (size-tiered, background Tokio task)
-- [ ] tonic gRPC server (Append, Query streaming, Compact)
-- [ ] All Phase 1 tests passing
+- [x] Compaction worker (size-tiered, background Tokio task)
+- [x] tonic gRPC server (Append, Query streaming, Compact, Snapshot)
+- [x] Prometheus metrics server (OnceLock counters + axum /metrics endpoint)
+- [x] Docker + CI (multi-stage Dockerfile, docker-compose, GitHub Actions, grpcurl smoke test)
+- [~] All Phase 1 tests passing (in progress)
 
 ### Phase 2 progress
 - [ ] Write buffer (bounded channel, backpressure, batch flush)
@@ -260,6 +270,7 @@ The only boundary between Go and Rust is `proto/storage/v1/storage.proto`.
 ### Known gaps / open questions
 - Compaction strategy: size-tiered chosen — leveled TBD for later phase
 - Bloom filter false positive rate: not yet tuned (default 1%)
+- WAL + memtable sharding ceiling (~3,400 req/s on APFS) is hardware-bound — Linux NVMe with truly independent devices per shard would approach linear scaling
 - slog adapter field extractor config format: not yet finalized
 
 ---
@@ -409,11 +420,19 @@ tracing::info!(
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MICIUS_WAL_DIR` | `/var/micius/data/wal` | WAL segment directory |
+| `MICIUS_WAL_MAX_SEGMENT_MB` | `4` | Rotate WAL segment after this many MB |
+| `MICIUS_WAL_CHANNEL_CAPACITY` | `2048` | Group commit channel buffer depth |
+| `MICIUS_WAL_MAX_BATCH` | `512` | Max requests batched per fsync |
+| `MICIUS_WAL_BATCH_DELAY_US` | `0` | Collect window before flushing batch (µs); tune to fsync latency on fast storage |
 | `MICIUS_CHUNK_DIR` | `/var/micius/data/chunks` | Chunk file directory |
-| `MICIUS_GRPC_PORT` | `50051` | gRPC server port |
-| `MICIUS_FLUSH_THRESHOLD_MB` | `64` | Memtable flush threshold |
+| `MICIUS_INDEX_PATH` | `/var/micius/data/index.bin` | Bincode snapshot path |
+| `MICIUS_MEMTABLE_FLUSH_MB` | `32` | Total memtable flush threshold (split evenly across shards) |
+| `MICIUS_MEMTABLE_SHARDS` | `16` | Number of memtable shards — must be a power of 2 |
 | `MICIUS_COMPACTION_INTERVAL_SECS` | `300` | Compaction worker interval |
-| `MICIUS_METRICS_PORT` | `9091` | Prometheus metrics port |
+| `MICIUS_COMPACTION_MIN_THRESHOLD` | `4` | Min chunk count before compaction runs |
+| `MICIUS_COMPACTION_SIZE_RATIO` | `1.5` | Size ratio for grouping candidate chunks |
+| `MICIUS_GRPC_ADDR` | `0.0.0.0:50051` | gRPC server listen address |
+| `MICIUS_METRICS_ADDR` | `0.0.0.0:9091` | Prometheus /metrics listen address |
 
 ### ingestion
 | Variable | Default | Description |
@@ -441,6 +460,12 @@ tracing::info!(
 ## Key Design Decisions
 
 These decisions are settled. Do not revisit without strong justification.
+
+**WAL group commit**: concurrent Append RPCs enqueue frames on an `mpsc` channel and await a `oneshot` reply. A single `wal_task` drains the backlog with `try_recv()`, writes all frames in one `write_all`, calls `sync_all()` once, then replies to all waiters. Batch size emerges from fsync latency × arrival rate — no artificial delay. Benchmark: 5.9× throughput at 100 workers vs the Mutex design (23k → 141k pts/s on macOS Intel).
+
+**WAL sharding (16 shards)**: each shard writes to `wal_dir/shard-{i}/` — an independent WalWriter and wal_task per shard. The append handler routes points to their shard, spawns one Tokio task per shard for parallel WAL appends, then joins all handles before memtable inserts. Total WAL wait = max(shard latencies) not sum. Per-shard recovery on startup (each shard replays its own directory independently). WAL GC is per-shard: after flush, `wals[i].drain_completed_before(seq)` runs immediately without waiting for other shards. Benchmark: +31% throughput on APFS (260k → 341k pts/s at 300 workers) — parallel fsync across independent subdirectories provides partial APFS-level parallelism.
+
+**Memtable sharding (16 shards)**: each write is routed to `shard = hash(series_key) & (N-1)` — xxh64 over `"metric_name,k1=v1,k2=v2"` (BTreeMap-sorted tags), bitmask instead of modulo (N must be a power of 2). Each shard has its own `Mutex<Memtable>` so concurrent writers on different series never contend. Flush is decoupled from the RPC handler: a 200ms periodic sweep scans shards sequentially, drains any exceeding their per-shard threshold, and advances a per-shard watermark. Benchmark: 10.9× throughput vs the original Mutex baseline (23k → 260k pts/s).
 
 **WAL entry format**: length-prefix + CRC32 checksum + protobuf payload. Length prefix enables forward scanning during recovery. CRC32 detects torn writes — recovery stops at first checksum mismatch, does not attempt to skip and continue.
 
@@ -471,6 +496,9 @@ cargo nextest run --test index test_multi_tag_intersection
 cargo nextest run --test index test_time_range_pruning
 cargo nextest run --test index test_stats_predicate_gt
 cargo nextest run --test compaction tests::compacted_chunks_queryable
+cargo nextest run --test wal test_group_commit_concurrent_appends_unique_sequences
+cargo nextest run --test wal test_group_commit_data_is_recoverable
+cargo nextest run --test server test_data_queryable_after_flush
 ```
 
 Or run all gate tests in one shot:

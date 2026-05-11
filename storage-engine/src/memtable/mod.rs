@@ -1,5 +1,5 @@
 use crate::chunk::format::U64_SIZE;
-use crate::types::{DataPoint, SeriesKey, ValuePredicate};
+use crate::types::{DataPoint, SeriesKey, ValuePredicate, series_id_from_parts};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 
@@ -123,4 +123,10 @@ impl Memtable {
             })
             .collect()
     }
+}
+
+pub fn shard_index(point: &DataPoint, shards: usize) -> usize {
+    let series_id = series_id_from_parts(&point.metric_name, &point.tags);
+    // shards is guaranteed to be a power of 2 by StorageConfig::load()
+    (series_id & (shards as u64 - 1)) as usize
 }

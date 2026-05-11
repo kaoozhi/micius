@@ -27,14 +27,21 @@ pub struct SeriesKey {
 
 impl SeriesKey {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut s = self.metric_name.clone();
+        let capacity = self.metric_name.len()
+            + self
+                .tags
+                .iter()
+                .map(|(k, v)| k.len() + v.len() + 2)
+                .sum::<usize>();
+        let mut buf = Vec::with_capacity(capacity);
+        buf.extend_from_slice(self.metric_name.as_bytes());
         for (k, v) in &self.tags {
-            s.push(',');
-            s.push_str(k);
-            s.push('=');
-            s.push_str(v);
+            buf.push(b',');
+            buf.extend_from_slice(k.as_bytes());
+            buf.push(b'=');
+            buf.extend_from_slice(v.as_bytes());
         }
-        s.into_bytes()
+        buf
     }
 
     pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
@@ -58,9 +65,20 @@ impl SeriesKey {
 
 impl From<&SeriesKey> for SeriesId {
     fn from(value: &SeriesKey) -> Self {
-        let bytes = value.to_bytes();
-        xxhash_rust::xxh64::xxh64(&bytes, 0)
+        xxhash_rust::xxh64::xxh64(&value.to_bytes(), 0)
     }
+}
+
+pub fn series_id_from_parts(metric_name: &str, tags: &BTreeMap<String, String>) -> SeriesId {
+    let mut h = xxhash_rust::xxh64::Xxh64::new(0);
+    h.update(metric_name.as_bytes());
+    for (k, v) in tags {
+        h.update(b",");
+        h.update(k.as_bytes());
+        h.update(b"=");
+        h.update(v.as_bytes());
+    }
+    h.digest()
 }
 
 /// Opaque stable identifier assigned to a SeriesKey on first registration.

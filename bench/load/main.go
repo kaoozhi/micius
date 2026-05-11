@@ -172,10 +172,14 @@ func worker(
 		}
 
 		// Build batch with real wall-clock timestamps.
+		// Each request picks batchSize *distinct* series by striding through the
+		// vocab from a random start — guarantees no two points share a series key,
+		// maximising shard spread for WAL sharding benchmarks.
 		points := make([]*storagev1.DataPoint, batchSize)
 		now := time.Now().UnixNano()
+		vocabStart := rng.Intn(len(vocab))
 		for i := range points {
-			s := vocab[rng.Intn(len(vocab))]
+			s := vocab[(vocabStart+i)%len(vocab)]
 			points[i] = &storagev1.DataPoint{
 				MetricName:  s.metric,
 				Tags:        s.tags,

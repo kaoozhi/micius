@@ -39,7 +39,9 @@ fn test_config(dir: &TempDir) -> StorageConfig {
         wal_max_segment_bytes: 64 * 1024 * 1024,
         wal_channel_capacity: 1024,
         wal_max_batch: 256,
+        wal_batch_delay_us: 0,
         memtable_flush_threshold_bytes: 32 * 1024 * 1024,
+        memtable_shards: 16,
         compaction_interval_secs: 300,
         compaction_min_threshold: 2,
         compaction_size_ratio: 2.0,
@@ -158,8 +160,11 @@ async fn test_data_survives_restart() {
     }
 }
 
-/// Concurrent appends from multiple tasks — exercises WAL Mutex and memtable
-/// Mutex under real concurrency. Verifies sequence uniqueness and no data loss.
+/// Concurrent appends from multiple tasks — exercises per-shard WAL and
+/// memtable locking under real concurrency. Verifies no data loss.
+/// Note: sequences are no longer globally unique — each WAL shard has its own
+/// sequence space, so two tasks writing to different shards can return the same
+/// sequence number. Data integrity (all points queryable) is the meaningful guarantee.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_concurrent_appends_are_serialised() {
     let dir = tempdir().unwrap();
@@ -187,25 +192,12 @@ async fn test_concurrent_appends_are_serialised() {
             srv.append(Request::new(AppendRequest { points }))
                 .await
                 .expect("append failed")
-                .into_inner()
-                .sequence
         });
     }
 
-    let mut sequences: Vec<u64> = Vec::new();
     while let Some(result) = set.join_next().await {
-        sequences.push(result.expect("task panicked"));
+        result.expect("task panicked");
     }
-
-    // All sequences must be unique — WAL serialises appends
-    let mut sorted = sequences.clone();
-    sorted.sort_unstable();
-    sorted.dedup();
-    assert_eq!(
-        sorted.len(),
-        n_tasks,
-        "every append must get a unique sequence"
-    );
 
     // All n_tasks * n_points points must be queryable
     let mut stream = server
@@ -328,8 +320,9 @@ async fn test_data_queryable_after_flush() {
     };
     config.ensure_dirs().await.unwrap();
     let server = StorageServer::open(&config).await.expect("open failed");
+    server.spawn_background_tasks(&config);
 
-    // Write 20 points — enough to exceed 512 bytes and trigger a flush
+    // Write 20 points — enough to exceed the per-shard threshold (512/16 = 32 bytes)
     server
         .append(Request::new(AppendRequest {
             points: (0..20)
@@ -339,8 +332,8 @@ async fn test_data_queryable_after_flush() {
         .await
         .expect("append failed");
 
-    // Give the async flush task a moment to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    // Wait for at least one sweep cycle (200ms) plus chunk write margin
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // All 20 points must be queryable — served from the chunk file
     let mut stream = server
@@ -467,6 +460,7 @@ async fn test_concurrent_reads_and_writes() {
     };
     config.ensure_dirs().await.unwrap();
     let server = Arc::new(StorageServer::open(&config).await.expect("open failed"));
+    server.spawn_background_tasks(&config);
 
     let n_writer_tasks = 4;
     let n_reader_tasks = 4;
@@ -531,8 +525,8 @@ async fn test_concurrent_reads_and_writes() {
         result.expect("task panicked");
     }
 
-    // Give any in-flight flush tasks time to complete
-    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+    // Give the periodic sweep time to flush any remaining data (≥1 sweep interval)
+    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     // Final consistency check — all written points must be visible
     let mut stream = server

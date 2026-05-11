@@ -223,7 +223,7 @@ impl ChunkWriter {
                 series_key: s.key.clone(),
                 entry: SeriesChunkEntry {
                     chunk_id,
-                    series_id: (&s.key).into(),
+                    series_id: xxhash_rust::xxh64::xxh64(&s.key_bytes, 0),
                     time_start_ns: s.time_start_ns,
                     time_end_ns: s.time_end_ns,
                     size_bytes: s.ts_compressed.len() + s.val_compressed.len() + U32_SIZE * 2,
