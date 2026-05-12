@@ -64,8 +64,8 @@ impl StorageServer {
         // and task spawning are done independently per shard in the same loop.
         // Watermarks are initialised to 0 — the first flush of each shard
         // advances them, and WAL GC only runs after that.
-        let mut wals: Vec<WalSender> = Vec::with_capacity(config.memtable_shards);
-        for i in 0..config.memtable_shards {
+        let mut wals: Vec<WalSender> = Vec::with_capacity(config.num_shards);
+        for i in 0..config.num_shards {
             let shard_dir = config.wal_dir.join(format!("shard-{:02}", i));
             let recovery = wal::recovery::recover(&shard_dir).await?;
             tracing::info!(
@@ -130,14 +130,14 @@ impl StorageServer {
             config.compaction_min_threshold,
             config.compaction_size_ratio,
         )));
-        let memtables: Vec<Arc<Mutex<Memtable>>> = (0..config.memtable_shards)
+        let memtables: Vec<Arc<Mutex<Memtable>>> = (0..config.num_shards)
             .map(|_| {
                 Arc::new(Mutex::new(Memtable::new(
-                    config.memtable_flush_threshold_bytes / config.memtable_shards,
+                    config.memtable_flush_threshold_bytes / config.num_shards,
                 )))
             })
             .collect();
-        let watermarks: Vec<Arc<AtomicU64>> = (0..config.memtable_shards)
+        let watermarks: Vec<Arc<AtomicU64>> = (0..config.num_shards)
             .map(|_| Arc::new(AtomicU64::new(0u64)))
             .collect();
         Ok(Self {
@@ -626,6 +626,7 @@ impl StorageServer {
                                     match wals[i].drain_completed_before(seq).await {
                                         Ok(paths) => {
                                             let mut deleted = 0usize;
+
                                             for path in &paths {
                                                 if let Err(e) = tokio::fs::remove_file(path).await {
                                                     // NotFound is benign — cleaned up by a previous run.
