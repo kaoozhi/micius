@@ -119,7 +119,9 @@ async fn test_resume_seq_continuous_across_restart() {
     drop(wal);
 
     // Simulate restart: recover to find last_sequence
-    let recovered = recover(test_dir.path()).await.expect("failed to recover");
+    let recovered = recover(test_dir.path(), 0u64)
+        .await
+        .expect("failed to recover");
     assert_eq!(recovered.last_sequence, 3);
 
     // Session 2: open with resume_seq from recovery
@@ -324,7 +326,7 @@ async fn test_group_commit_data_is_recoverable() {
     // append() only returns after sync_all() — data is durable before drop.
     drop(wal);
 
-    let recovered = recover(dir.path()).await.unwrap();
+    let recovered = recover(dir.path(), 0).await.unwrap();
     assert_eq!(recovered.points.len(), batch_1.len() + batch_2.len());
     assert_points_eq(&batch_1, &recovered.points, 0);
     assert_points_eq(&batch_2, &recovered.points, batch_1.len());
@@ -362,7 +364,9 @@ async fn test_append_and_recover() {
     wal.append(&batch_2).await.expect("failed to append");
 
     drop(wal);
-    let recovered = recover(test_dir.path()).await.expect("failed to recover");
+    let recovered = recover(test_dir.path(), 0u64)
+        .await
+        .expect("failed to recover");
     assert_eq!(recovered.points.len(), batch_1.len() + batch_2.len());
     assert_points_eq(&batch_1, &recovered.points, 0);
     assert_points_eq(&batch_2, &recovered.points, batch_1.len());
@@ -398,7 +402,9 @@ async fn test_torn_write_stops_recovery() {
     // large enough to land inside batch_2's payload.
     file.set_len(size - 5).unwrap();
 
-    let recovered = recover(test_dir.path()).await.expect("failed to recover");
+    let recovered = recover(test_dir.path(), 0)
+        .await
+        .expect("failed to recover");
     assert!(
         recovered.torn_write_detected,
         "expected torn write to be detected"
@@ -437,7 +443,9 @@ async fn test_checksum_mismatch_stops_recovery() {
     let target = bytes.len() - 10; // somewhere in the last payload
     bytes[target] ^= 0x01;
     std::fs::write(&segment, &bytes).unwrap();
-    let recovered = recover(test_dir.path()).await.expect("failed to recover");
+    let recovered = recover(test_dir.path(), 0)
+        .await
+        .expect("failed to recover");
     assert!(
         recovered.torn_write_detected,
         "expected torn write to be detected"
@@ -459,7 +467,9 @@ async fn test_recovery_across_segments() {
     wal.append(&batch_2).await.expect("failed to append");
 
     drop(wal);
-    let recovered = recover(test_dir.path()).await.expect("failed to recover");
+    let recovered = recover(test_dir.path(), 0)
+        .await
+        .expect("failed to recover");
     assert_eq!(recovered.points.len(), batch_1.len() + batch_2.len());
     assert_points_eq(&batch_1, &recovered.points, 0);
     assert_points_eq(&batch_2, &recovered.points, batch_1.len());

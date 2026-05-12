@@ -30,7 +30,11 @@ pub struct StorageServer {
     pub chunk_writer: Arc<ChunkWriter>,
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
     pub snapshot_path: PathBuf,
-    pub mem_shard_watermarks: Vec<Arc<AtomicU64>>,
+    pub shard_watermarks: Vec<Arc<AtomicU64>>,
+    /// Monotonically increasing counter incremented once per acknowledged Append RPC.
+    /// Returned as `AppendResponse.sequence` — an opaque token clients can use to
+    /// detect out-of-order acks or as a deduplication key. Not a WAL position.
+    pub append_seq: Arc<AtomicU64>,
 }
 
 impl StorageServer {
@@ -49,9 +53,9 @@ impl StorageServer {
         // 1. Index snapshot ─────────────────────────────────────────────────
         // None = first run or missing snapshot → start from empty index.
         // shard recovers its own WAL independently using its own last_sequence.
-        let (mut idx, _) = match index::persistence::load_index(&config.index_path).await? {
-            None => (ChunkIndex::new(), 0),
-            Some((idx, seq)) => (idx, seq),
+        let mut idx = match index::persistence::load_index(&config.index_path).await? {
+            None => ChunkIndex::new(),
+            Some(idx) => idx,
         };
         tracing::info!(
             series = idx.series_count(),
@@ -67,14 +71,20 @@ impl StorageServer {
         let mut wals: Vec<WalSender> = Vec::with_capacity(config.num_shards);
         for i in 0..config.num_shards {
             let shard_dir = config.wal_dir.join(format!("shard-{:02}", i));
-            let recovery = wal::recovery::recover(&shard_dir).await?;
+            // Per-shard watermark: highest WAL sequence confirmed present in the
+            // index snapshot. Segments whose max_seq ≤ watermark are already in
+            // chunk files and safe to delete without replaying.
+            let shard_watermark = idx.shard_watermarks.get(i).copied().unwrap_or(0);
+            let recovery = wal::recovery::recover(&shard_dir, shard_watermark).await?;
             tracing::info!(
                 shard = i,
                 points = recovery.points.len(),
+                watermark = shard_watermark,
                 "WAL shard recovered"
             );
 
-            if !recovery.points.is_empty() {
+            let recoverable = !recovery.points.is_empty();
+            if recoverable {
                 let mut memtable = Memtable::new(config.memtable_flush_threshold_bytes);
                 for point in recovery.points {
                     memtable.insert(point);
@@ -98,7 +108,17 @@ impl StorageServer {
             if recovery.segments_replayed > 0 {
                 writer.rotate().await?;
             }
-            let to_delete = writer.drain_completed_before(u64::MAX);
+
+            // If we replayed WAL data and wrote a recovery chunk, all entries up to
+            // last_sequence are now in chunk files — drain everything replayed.
+            // If no replay was needed, only drain segments already covered by the
+            // snapshot watermark; entries after the watermark are not yet in chunks.
+            let drain_threshold = if recoverable {
+                recovery.last_sequence
+            } else {
+                shard_watermark
+            };
+            let to_delete = writer.drain_completed_before(drain_threshold);
             let mut deleted = 0usize;
             for path in &to_delete {
                 if let Err(e) = tokio::fs::remove_file(path).await {
@@ -147,7 +167,8 @@ impl StorageServer {
             chunk_writer: writer,
             compaction_worker,
             snapshot_path: config.index_path.clone(),
-            mem_shard_watermarks: watermarks,
+            shard_watermarks: watermarks,
+            append_seq: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -216,9 +237,10 @@ impl StorageService for StorageServer {
             })
             .collect();
 
-        let mut max_seq = 0u64;
+        // Drain WAL task results — we only care about errors, not the per-shard
+        // sequence numbers (which are on incomparable scales across shards).
         for handle in handles {
-            let seq = handle
+            handle
                 .await
                 .map_err(|_| Status::internal("WAL task panicked"))?
                 .map_err(|e| {
@@ -227,7 +249,6 @@ impl StorageService for StorageServer {
                         .inc();
                     Status::internal(format!("WAL error: {}", e))
                 })?;
-            max_seq = max_seq.max(seq);
         }
 
         // ── Step 4: Memtable inserts ──────────────────────────────────────────
@@ -247,8 +268,12 @@ impl StorageService for StorageServer {
             .with_label_values(&["ok"])
             .inc();
 
-        tracing::info!(points = pts.len(), seq = max_seq, "append");
-        Ok(Response::new(AppendResponse { sequence: max_seq }))
+        // Global append counter: strictly monotonic across all shards, safe to
+        // compare across consecutive RPCs. Relaxed ordering is sufficient — this
+        // counter does not synchronize any payload data.
+        let seq = self.append_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(points = pts.len(), seq, "append");
+        Ok(Response::new(AppendResponse { sequence: seq }))
     }
 
     type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
@@ -452,19 +477,18 @@ impl StorageService for StorageServer {
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         tracing::info!("snapshot");
-        let seq = self
-            .mem_shard_watermarks
+        let watermarks: Vec<u64> = self
+            .shard_watermarks
             .iter()
             .map(|w| w.load(Ordering::Acquire))
-            .max()
-            .unwrap_or(0);
+            .collect();
         let index = self.index.read().await;
 
-        crate::index::persistence::save_index(&index, &self.snapshot_path, seq)
+        crate::index::persistence::save_index(&index, &self.snapshot_path, &watermarks)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        tracing::info!(seq, path = %self.snapshot_path.display(), "snapshot saved");
+        tracing::info!(path = %self.snapshot_path.display(), "snapshot saved");
         Ok(Response::new(SnapshotResponse {
             snapshot_path: self.snapshot_path.to_string_lossy().into_owned(),
         }))
@@ -535,20 +559,22 @@ impl StorageServer {
         {
             let idx_clone = Arc::clone(&self.index);
             let watermarks: Vec<Arc<AtomicU64>> =
-                self.mem_shard_watermarks.iter().map(Arc::clone).collect();
+                self.shard_watermarks.iter().map(Arc::clone).collect();
             let index_path = self.snapshot_path.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     ticker.tick().await;
-                    let seq = watermarks
+                    let current_watermarks: Vec<u64> = watermarks
                         .iter()
                         .map(|w| w.load(Ordering::Acquire))
-                        .max()
-                        .unwrap_or(0);
+                        .collect();
 
                     let index = idx_clone.read().await;
-                    if let Err(e) = index::persistence::save_index(&index, &index_path, seq).await {
+                    if let Err(e) =
+                        index::persistence::save_index(&index, &index_path, &current_watermarks)
+                            .await
+                    {
                         tracing::error!(error = %e, "periodic index snapshot failed");
                     }
                     // index read lock released here (RwLockReadGuard dropped)
@@ -564,7 +590,7 @@ impl StorageServer {
             let index = Arc::clone(&self.index);
             let wals: Vec<WalSender> = self.wals.clone();
             let watermarks: Vec<Arc<AtomicU64>> =
-                self.mem_shard_watermarks.iter().map(Arc::clone).collect();
+                self.shard_watermarks.iter().map(Arc::clone).collect();
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(200));
