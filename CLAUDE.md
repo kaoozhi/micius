@@ -19,6 +19,7 @@ This project is built and tested by the developer manually.
 - **Review and advise** — critique code I write, suggest improvements, catch bugs
 - **Explain** — explain concepts, tradeoffs, and design decisions when asked
 - **Targeted help** — write specific functions or components when explicitly asked
+- **README sync** — after any code change that affects architecture, env vars, startup behaviour, background tasks, or design decisions: identify which README sections are stale, propose the minimal accurate diff, and apply it only when asked
 - **Do not** autonomously generate entire files or modules unprompted
 - **Do not** run tests — I run all tests myself
 - **Do not** run build commands — I build manually
