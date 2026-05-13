@@ -41,7 +41,7 @@ fn test_config(dir: &TempDir) -> StorageConfig {
         wal_max_batch: 256,
         wal_batch_delay_us: 0,
         memtable_flush_threshold_bytes: 32 * 1024 * 1024,
-        memtable_shards: 16,
+        num_shards: 16,
         compaction_interval_secs: 300,
         compaction_min_threshold: 2,
         compaction_size_ratio: 2.0,
@@ -551,4 +551,301 @@ async fn test_concurrent_reads_and_writes() {
         total, expected,
         "all {expected} written points must be visible after concurrent read+write"
     );
+}
+
+/// Crash-between-flush-and-snapshot scenario — the dangerous case where:
+///   1. Points are appended and WAL-fsynced
+///   2. The memtable is flushed to a chunk file (chunk registered in index)
+///   3. The process crashes before the index snapshot is saved
+///
+/// Without the persisted_watermarks guard the WAL GC would have deleted segments
+/// immediately after flush, leaving no way to reconstruct the index on restart.
+/// With the fix, WAL segments are retained until a snapshot confirms them on
+/// disk — recovery replays those segments and the data must be queryable.
+///
+/// Simulated by: write → force-flush → skip snapshot → reopen (crash recovery).
+#[tokio::test]
+async fn test_no_data_loss_crash_before_snapshot() {
+    let dir = tempdir().unwrap();
+    let config = StorageConfig {
+        // Tiny threshold so a single append triggers a flush on the next sweep.
+        memtable_flush_threshold_bytes: 512,
+        ..test_config(&dir)
+    };
+    config.ensure_dirs().await.unwrap();
+
+    // ── Session 1: write, flush, then "crash" (drop without saving snapshot) ─
+    {
+        let server = StorageServer::open(&config).await.expect("open failed");
+        server.spawn_background_tasks(&config);
+
+        server
+            .append(Request::new(AppendRequest {
+                points: (0..10)
+                    .map(|i| data_point("cpu.load", "crash-host", i * 1_000_000_000, i as f64))
+                    .collect(),
+            }))
+            .await
+            .expect("append failed");
+
+        // Wait for the sweep to flush to a chunk file (≥1 sweep cycle = 200ms).
+        // The snapshot task fires every 60s — it will NOT have run yet, so
+        // persisted_watermarks remain at 0 and WAL GC does nothing. That's the
+        // invariant this test verifies.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // server drops here — simulates crash. No snapshot was saved.
+        // WAL segments for the flushed data must still exist on disk.
+    }
+
+    // ── Session 2: reopen — recovery must replay WAL and restore all points ─
+    {
+        let server = StorageServer::open(&config).await.expect("reopen failed");
+
+        let mut stream = server
+            .query(Request::new(QueryRequest {
+                metric_name: "cpu.load".to_string(),
+                tag_filters: HashMap::from([("host".to_string(), "crash-host".to_string())]),
+                time_start_ns: None,
+                time_end_ns: None,
+            }))
+            .await
+            .expect("query after recovery failed")
+            .into_inner();
+
+        let mut total = 0usize;
+        while let Some(resp) = stream.next().await {
+            resp.expect("stream error after recovery");
+            total += 1;
+        }
+
+        assert_eq!(
+            total, 10,
+            "all 10 points must survive a crash before snapshot via WAL recovery"
+        );
+    }
+}
+
+/// Verifies that after a successful snapshot the WAL GC is unblocked and
+/// segments covered by the snapshot are eventually deleted, while data
+/// remains fully queryable after a subsequent restart.
+///
+/// Timeline:
+///   1. Write points → flush to chunk (persisted_watermarks still 0)
+///   2. Save snapshot explicitly (persisted_watermarks advance)
+///   3. Trigger WAL GC (next sweep cycle)
+///   4. Reopen — no WAL to replay (segments deleted), index loaded from snapshot
+///   5. All points must still be queryable
+#[tokio::test]
+async fn test_wal_gc_unblocked_after_snapshot_no_data_loss() {
+    let dir = tempdir().unwrap();
+    let config = StorageConfig {
+        memtable_flush_threshold_bytes: 512,
+        ..test_config(&dir)
+    };
+    config.ensure_dirs().await.unwrap();
+
+    // ── Session 1: write → flush → snapshot → let GC run ────────────────────
+    {
+        use storage_engine::proto::storage::v1::{
+            SnapshotRequest, storage_service_server::StorageService,
+        };
+
+        let server = StorageServer::open(&config).await.expect("open failed");
+        server.spawn_background_tasks(&config);
+
+        server
+            .append(Request::new(AppendRequest {
+                points: (0..10)
+                    .map(|i| data_point("cpu.load", "gc-host", i * 1_000_000_000, i as f64))
+                    .collect(),
+            }))
+            .await
+            .expect("append failed");
+
+        // Wait for the sweep to flush to a chunk (≥1 sweep cycle).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Explicitly save the snapshot — this advances persisted_watermarks,
+        // which unblocks WAL GC for the next sweep cycle.
+        server
+            .snapshot(Request::new(SnapshotRequest {}))
+            .await
+            .expect("snapshot failed");
+
+        // Wait for at least one more sweep — GC should now delete the segments
+        // whose watermarks are covered by the snapshot.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Verify persisted_watermarks advanced: at least one shard must be non-zero
+        // (the shard that received the append).
+        let any_persisted_nonzero = server
+            .persisted_watermarks
+            .iter()
+            .any(|w| w.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            any_persisted_nonzero,
+            "at least one persisted watermark must be non-zero after snapshot"
+        );
+    }
+
+    // ── Session 2: reopen — data must come from index snapshot, not WAL ──────
+    {
+        let server = StorageServer::open(&config)
+            .await
+            .expect("reopen after GC failed");
+
+        let mut stream = server
+            .query(Request::new(QueryRequest {
+                metric_name: "cpu.load".to_string(),
+                tag_filters: HashMap::from([("host".to_string(), "gc-host".to_string())]),
+                time_start_ns: None,
+                time_end_ns: None,
+            }))
+            .await
+            .expect("query after GC+restart failed")
+            .into_inner();
+
+        let mut total = 0usize;
+        while let Some(resp) = stream.next().await {
+            resp.expect("stream error after GC+restart");
+            total += 1;
+        }
+
+        assert_eq!(
+            total, 10,
+            "all 10 points must be queryable after WAL GC + restart (served from chunk via index)"
+        );
+    }
+}
+
+/// WAL partial-replay scenario — the most nuanced recovery case:
+///
+///   Batch A: written → flushed to chunk → snapshot saved (watermark = seq_A)
+///            WAL entries for A are still on disk (GC not yet run — periodic sweep
+///            fires every 200ms but snapshot was just saved, GC at next sweep)
+///   Batch B: written → WAL-fsynced → NOT flushed yet → crash
+///
+/// On restart:
+///   - Snapshot loaded → watermark = seq_A
+///   - WAL recovery per shard: entries ≤ seq_A SKIPPED (A already in chunk)
+///                              entries >  seq_A REPLAYED (B not yet in any chunk)
+///   - Recovery chunk written for B only
+///   - drain_completed_before(last_sequence) cleans up all WAL segments
+///
+/// Invariants:
+///   - Batch A points queryable exactly once (from chunk, not double-counted)
+///   - Batch B points queryable (from recovery chunk)
+///   - Total = A + B, not 2×A + B
+#[tokio::test]
+async fn test_partial_wal_replay_skips_snapshotted_entries() {
+    let dir = tempdir().unwrap();
+    let config = StorageConfig {
+        memtable_flush_threshold_bytes: 512,
+        ..test_config(&dir)
+    };
+    config.ensure_dirs().await.unwrap();
+
+    const BATCH_A: usize = 10;
+    const BATCH_B: usize = 8;
+
+    // ── Session 1 ────────────────────────────────────────────────────────────
+    {
+        use storage_engine::proto::storage::v1::{
+            SnapshotRequest, storage_service_server::StorageService,
+        };
+
+        let server = StorageServer::open(&config).await.expect("open failed");
+        server.spawn_background_tasks(&config);
+
+        // Batch A — distinct host so we can count each batch independently.
+        server
+            .append(Request::new(AppendRequest {
+                points: (0..BATCH_A as i64)
+                    .map(|i| data_point("cpu.load", "host-a", i * 1_000_000_000, i as f64))
+                    .collect(),
+            }))
+            .await
+            .expect("batch A append failed");
+
+        // Wait for flush (≥1 sweep cycle).
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // Save snapshot → watermark advances to cover batch A's WAL entries.
+        // WAL entries for A are now safe to GC, but GC has not run yet.
+        server
+            .snapshot(Request::new(SnapshotRequest {}))
+            .await
+            .expect("snapshot failed");
+
+        // Batch B — written after snapshot. These WAL entries have seq > watermark
+        // and are NOT covered by the snapshot. They will need replay on recovery.
+        server
+            .append(Request::new(AppendRequest {
+                points: (0..BATCH_B as i64)
+                    .map(|i| {
+                        // Offset timestamps so they don't collide with batch A.
+                        data_point(
+                            "cpu.load",
+                            "host-b",
+                            (BATCH_A as i64 + i) * 1_000_000_000,
+                            i as f64,
+                        )
+                    })
+                    .collect(),
+            }))
+            .await
+            .expect("batch B append failed");
+
+        // Crash — batch B is WAL-durable but not flushed to a chunk.
+        // Snapshot covers only batch A. WAL segments for B survive on disk.
+    }
+
+    // ── Session 2: recovery ───────────────────────────────────────────────────
+    {
+        let server = StorageServer::open(&config).await.expect("reopen failed");
+
+        // Query batch A (host-a) — must come from the pre-crash chunk exactly once.
+        let mut stream_a = server
+            .query(Request::new(QueryRequest {
+                metric_name: "cpu.load".to_string(),
+                tag_filters: HashMap::from([("host".to_string(), "host-a".to_string())]),
+                time_start_ns: None,
+                time_end_ns: None,
+            }))
+            .await
+            .expect("query host-a failed")
+            .into_inner();
+        let mut count_a = 0usize;
+        while let Some(resp) = stream_a.next().await {
+            resp.expect("stream error host-a");
+            count_a += 1;
+        }
+
+        // Query batch B (host-b) — must come from the recovery chunk.
+        let mut stream_b = server
+            .query(Request::new(QueryRequest {
+                metric_name: "cpu.load".to_string(),
+                tag_filters: HashMap::from([("host".to_string(), "host-b".to_string())]),
+                time_start_ns: None,
+                time_end_ns: None,
+            }))
+            .await
+            .expect("query host-b failed")
+            .into_inner();
+        let mut count_b = 0usize;
+        while let Some(resp) = stream_b.next().await {
+            resp.expect("stream error host-b");
+            count_b += 1;
+        }
+
+        assert_eq!(
+            count_a, BATCH_A,
+            "batch A must appear exactly {BATCH_A} times — not double-counted from WAL replay"
+        );
+        assert_eq!(
+            count_b, BATCH_B,
+            "batch B must be fully recovered from WAL replay ({BATCH_B} points)"
+        );
+    }
 }

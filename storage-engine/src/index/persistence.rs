@@ -13,17 +13,18 @@ use std::path::Path;
 #[derive(serde::Serialize, serde::Deserialize, Default)]
 struct IndexSnapshot {
     version: u8,
-    last_wal_sequence: u64,
+    /// Per-shard WAL watermarks — one entry per shard, parallel to WAL/memtable shard index.
+    shard_watermarks: Vec<u64>,
     series_registry: Vec<(SeriesId, SeriesKey)>,
     time_index: Vec<(SeriesId, Vec<(i64, SeriesChunkEntry)>)>,
     chunk_stats: Vec<(ChunkId, SeriesId, SeriesChunkStats)>,
     chunk_files: Vec<(ChunkId, ChunkMeta)>,
 }
 
-pub async fn save_index(index: &ChunkIndex, path: &Path, last_wal_sequence: u64) -> Result<()> {
+pub async fn save_index(index: &ChunkIndex, path: &Path, shard_watermarks: &[u64]) -> Result<()> {
     let snapshot = IndexSnapshot {
-        version: 1,
-        last_wal_sequence,
+        version: 2,
+        shard_watermarks: shard_watermarks.to_vec(),
         series_registry: index
             .series_registry
             .iter()
@@ -63,20 +64,26 @@ pub async fn save_index(index: &ChunkIndex, path: &Path, last_wal_sequence: u64)
     Ok(())
 }
 
-pub async fn load_index(path: &Path) -> Result<Option<(ChunkIndex, u64)>> {
+pub async fn load_index(path: &Path) -> Result<Option<ChunkIndex>> {
     if !path.exists() {
         return Ok(None);
     }
     let bytes = tokio::fs::read(path).await?;
-    let snapshot: IndexSnapshot = bincode::deserialize(&bytes)?;
-    anyhow::ensure!(
-        snapshot.version == 1,
-        "unsupported snapshot version {}",
-        snapshot.version
-    );
-    let last_wal_sequence = snapshot.last_wal_sequence;
-    let index = rebuild_index(snapshot);
-    Ok(Some((index, last_wal_sequence)))
+    let snapshot: IndexSnapshot = match bincode::deserialize(&bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!("index snapshot failed to deserialize (old format?), discarding");
+            return Ok(None);
+        }
+    };
+    if snapshot.version != 2 {
+        tracing::warn!(
+            version = snapshot.version,
+            "index snapshot version mismatch, discarding"
+        );
+        return Ok(None);
+    }
+    Ok(Some(rebuild_index(snapshot)))
 }
 
 fn rebuild_index(snapshot: IndexSnapshot) -> ChunkIndex {
@@ -116,5 +123,6 @@ fn rebuild_index(snapshot: IndexSnapshot) -> ChunkIndex {
             .iter()
             .map(|(cid, meta)| (*cid, meta.clone()))
             .collect(),
+        shard_watermarks: snapshot.shard_watermarks,
     }
 }

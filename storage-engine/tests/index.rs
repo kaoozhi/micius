@@ -358,16 +358,20 @@ async fn test_persistence_roundtrip_single_series() {
 
     let snap_dir = tempdir().unwrap();
     let snap_path = snap_dir.path().join("index.bin");
-    save_index(&index, &snap_path, wal_sequence)
+    save_index(&index, &snap_path, &[wal_sequence])
         .await
         .expect("save failed");
 
-    let (loaded, loaded_seq) = load_index(&snap_path)
+    let loaded = load_index(&snap_path)
         .await
         .expect("load failed")
         .expect("snapshot should exist");
 
-    assert_eq!(loaded_seq, wal_sequence, "WAL sequence must roundtrip");
+    assert_eq!(
+        loaded.shard_watermarks,
+        vec![wal_sequence],
+        "shard watermarks must roundtrip"
+    );
     assert_eq!(loaded.series_count(), 1);
     assert_eq!(loaded.chunk_file_count(), 3);
 
@@ -410,11 +414,11 @@ async fn test_persistence_roundtrip_multi_series() {
 
     let snap_dir = tempdir().unwrap();
     let snap_path = snap_dir.path().join("index.bin");
-    save_index(&index, &snap_path, 0)
+    save_index(&index, &snap_path, &[])
         .await
         .expect("save failed");
 
-    let (loaded, _) = load_index(&snap_path)
+    let loaded = load_index(&snap_path)
         .await
         .expect("load failed")
         .expect("snapshot should exist");

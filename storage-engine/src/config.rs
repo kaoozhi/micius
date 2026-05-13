@@ -39,8 +39,10 @@ pub struct StorageConfig {
     /// Larger threshold = fewer chunk files but more memory usage
     pub memtable_flush_threshold_bytes: usize,
 
-    /// Memtable shards number
-    pub memtable_shards: usize,
+    /// Number of shards for both WAL and memtable (must be a power of 2, default 16).
+    /// WAL shard i writes to `wal_dir/shard-{i}/`; memtable shard i holds the
+    /// corresponding series. Keeping them 1:1 makes per-shard WAL GC correct and cheap.
+    pub num_shards: usize,
 
     /// Compaction runs every this many seconds (default 300)
     pub compaction_interval_secs: u64,
@@ -60,10 +62,10 @@ pub struct StorageConfig {
 
 impl StorageConfig {
     pub fn load() -> Result<Self> {
-        let memtable_shards = env_usize("MICIUS_MEMTABLE_SHARDS", 16);
+        let num_shards = env_usize("MICIUS_NUM_SHARDS", 16);
         anyhow::ensure!(
-            memtable_shards >= 1 && memtable_shards.is_power_of_two(),
-            "MICIUS_MEMTABLE_SHARDS must be a power of 2 >= 1, got {memtable_shards}"
+            num_shards >= 1 && num_shards.is_power_of_two(),
+            "MICIUS_NUM_SHARDS must be a power of 2 >= 1, got {num_shards} (controls both WAL and memtable shards)"
         );
         Ok(Self {
             wal_dir: env_path("MICIUS_WAL_DIR", "/var/micius/data/wal"),
@@ -73,7 +75,7 @@ impl StorageConfig {
             wal_channel_capacity: env_usize("MICIUS_WAL_CHANNEL_CAPACITY", 1024),
             wal_max_batch: env_usize("MICIUS_WAL_MAX_BATCH", 256),
             memtable_flush_threshold_bytes: env_usize("MICIUS_MEMTABLE_FLUSH_MB", 32) * 1024 * 1024,
-            memtable_shards,
+            num_shards,
             wal_batch_delay_us: env_u64("MICIUS_WAL_BATCH_DELAY_US", 0),
             compaction_interval_secs: env_u64("MICIUS_COMPACTION_INTERVAL_SECS", 300),
             compaction_min_threshold: env_usize("MICIUS_COMPACTION_MIN_THRESHOLD", 4),
@@ -85,7 +87,7 @@ impl StorageConfig {
 
     pub async fn ensure_dirs(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.wal_dir).await?;
-        for i in 0..self.memtable_shards {
+        for i in 0..self.num_shards {
             tokio::fs::create_dir_all(self.wal_dir.join(format!("shard-{:02}", i))).await?;
         }
         tokio::fs::create_dir_all(&self.chunk_dir).await?;

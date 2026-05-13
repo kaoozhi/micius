@@ -17,20 +17,20 @@ Micius covers the full observability stack: multi-source metrics ingestion (DogS
 [UDP metrics]    ─┐
 [WebSocket feed] ─┤─► [Write Buffer] ─── gRPC Append ─────────────────┐
 [HTTP scrape]    ─┤    (Go ingestion)                                 │
-[TCP log stream] ─┘                                                    ▼
-                                                  ┌──────────────────────────────────┐
-                                                  │  WAL  (group commit · CRC32)     │
-                                                  │  Memtable  (16 shards · BTreeMap)│
-                                                  │  Chunk files  (δ-encode · lz4)   │
-                                                  │  ChunkIndex  (inverted · pruning)│
-                                                  │  Compaction  (size-tiered)       │
-                                                  └──────────────────┬───────────────┘
-                                                                     │ gRPC (read)
-                                                  ┌──────────────────▼───────────────┐
-                            HTTP API ◄────────────┤  Aggregation engine  (Go)        │
-                            Webhooks ◄────────────┤  Alert worker                    │
-                                                  │  Webhook outbox (Postgres)       │
-                                                  └──────────────────────────────────┘
+[TCP log stream] ─┘                                                   ▼
+                                                  ┌──────────────────────────────────────────┐
+                                                  │  WAL  (16 shards · group commit · CRC32) │
+                                                  │  Memtable  (16 shards · BTreeMap)        │
+                                                  │  Chunk files  (δ-encode · lz4)           │
+                                                  │  ChunkIndex  (inverted · pruning)        │
+                                                  │  Compaction  (size-tiered)               │
+                                                  └───────────────────┬──────────────────────┘
+                                                                      │ gRPC (read)
+                                                      ┌───────────────▼──────────────────┐
+                                HTTP API ◄────────────┤  Aggregation engine  (Go)        │
+                                Webhooks ◄────────────┤  Alert worker                    │
+                                                      │  Webhook outbox (Postgres)       │
+                                                      └──────────────────────────────────┘
 ```
 
 Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query layers) are in progress.
@@ -45,7 +45,7 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
   │  1. load index snapshot  ──► ChunkIndex  (or empty on first start)         │
   │  2. WAL replay  (16 shards · CRC32 per frame · stop at first torn write)   │
   │  3. flush recovered points  ──► .mcs chunk  ──► ChunkIndex.register()      │
-  │  4. WAL.rotate() + drain_completed(u64::MAX)  ──► delete replayed segments │
+  │  4. WAL.rotate() + drain_completed(last_seq | watermark)  ──► delete segs  │
   │  5. open WAL writer  (resume_seq = recovery.last_sequence)                 │
   │                                                                            │
   │  ─── only after step 5: gRPC server + background tasks start ───────────   │
@@ -108,12 +108,13 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
   │      for each shard: drain if should_flush()                               │
   │      ├─ ChunkWriter.write()  →  .mcs file  (δ-encode · lz4 · bloom)        │
   │      ├─ ChunkIndex.register()  (under write lock, no disk I/O held)        │
-  │      ├─ watermark[i].store(wal.current_sequence(), Release)                │
-  │      └─ wals[i].drain_completed_before(watermarks[i])  → delete shard segs│
+  │      ├─ shard_watermarks[i].store(wal.current_sequence(), Release)         │
+  │      └─ wals[i].drain_completed_before(persisted_watermarks[i])  ──► GC    │
   │                                                                            │
   │  Snapshot worker  (every 60s)                                              │
-  │      WAL.current_sequence()  +  ChunkIndex  ──► bincode  ──► index.bin     │
-  │      (WAL sequence read before index read lock acquired)                   │
+  │      shard_watermarks[i].load(Acquire) × 16  +  ChunkIndex  ──► index.bin  │
+  │      persisted_watermarks[i].store(w, Release)  (after save_index fsync)   │
+  │      WAL GC for covered segments unblocked on the next sweep               │
   │                                                                            │
   └────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -150,10 +151,37 @@ The WAL is lock-free on the write path — writers enqueue via channel and await
 Write path:  N parallel WAL channel sends (no lock · tokio tasks) → join → Memtable[i] Mutex → released
 Sweep path:  Memtable[i] Mutex (drain) → released → Index RwLock write → released → WAL channel send
 Query path:  Memtable[i] Mutex → released (per shard) → Index RwLock read → released before disk I/O
-Snapshot:    Index RwLock read  (WAL sequence is AtomicU64 — no lock needed)
+Snapshot:    Index RwLock read  (shard watermarks are Vec<AtomicU64> — no lock needed)
 ```
 
 The sweep holds the Index write lock only for `register()`, never while doing disk I/O. The query path releases the Index read lock before any `read_series()` call. No two locks from different levels are ever held simultaneously. Eight concurrent-read/concurrent-write integration tests verify this under real multi-thread load with `#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`.
+
+### Durability before acknowledgement
+
+Every `Append` RPC waits for the WAL group commit task to call `fsync` before returning `Ok` — the durability guarantee is unchanged, only the mechanism differs. No reply is sent until `sync_all()` has completed for the batch containing that request. On crash recovery, the engine:
+1. Loads the last index snapshot (bincode)
+2. Replays WAL entries with CRC32 verification — skips entries already in the snapshot (sequence ≤ shard watermark), stops at first torn write
+3. Flushes recovered points to a new chunk file
+4. Rotates and deletes stale WAL segments
+5. Only then starts accepting live traffic
+
+**WAL GC safety: gated on snapshot durability**
+
+A subtle durability gap exists between flush and snapshot. After the periodic sweep flushes a shard to a chunk file and registers it in the in-memory `ChunkIndex`, the chunk is durably on disk — but the index snapshot may not have been saved yet (the snapshot task fires every 60s). If WAL GC ran immediately using the live `shard_watermarks`, it would delete the segments that produced that chunk. A crash before the next snapshot would leave the chunk orphaned: invisible to the next startup because the loaded index doesn't know it exists, and with no WAL left to reconstruct it. Data silently lost.
+
+The fix is `persisted_watermarks` — a second `Vec<Arc<AtomicU64>>` that only advances when `save_index()` returns `Ok`. WAL GC uses `persisted_watermarks` (via `Acquire` load), not `shard_watermarks`. Until a snapshot durably records a chunk in the index, the WAL segments that produced it are retained on disk:
+
+```
+flush    → shard_watermarks[i].store(seq, Release)      (live watermark advances)
+snapshot → persisted_watermarks[i].store(seq, Release)  (after fsync · GC now safe)
+GC       → gc_seq = persisted_watermarks[i].load(Acquire)
+            drain_completed_before(gc_seq)  deletes only snapshot-confirmed segments
+```
+
+Three-state safety window:
+1. **Flush done, no snapshot yet** — `shard_watermarks > persisted_watermarks` — GC blocked, segments retained
+2. **Snapshot saved** — `persisted_watermarks` catches up — GC unblocked for those segments on the next sweep
+3. **Crash between flush and snapshot** — restart loads old snapshot (watermark = last persisted), replays only WAL entries above that watermark, rebuilds the chunk — no double-counting of already-snapshotted entries
 
 ### WAL group commit — one fsync for N concurrent writers
 
@@ -173,7 +201,7 @@ WAL group commit exposed the next bottleneck: all concurrent writers serialising
 - **Routing**: each point hashes to `shard = hash(metric_name + sorted_tags) & 15` — a single bitmask, no division, same series always routes to the same shard
 - **Write path**: acquires only the relevant shard locks, never two simultaneously
 - **Flush path**: removed from the RPC handler entirely — a 200ms periodic sweep scans shards sequentially, draining any that exceed their per-shard threshold
-- **WAL safety**: each shard publishes a watermark after its flush; WAL segments are only deleted when `min(all watermarks)` covers them, preventing data loss if a shard has not flushed yet
+- **WAL safety**: each shard publishes its own `shard_watermarks[i]` after flush; WAL GC is gated on `persisted_watermarks[i]` — a separate watermark that only advances after `save_index()` fsync succeeds — so segments are never deleted before the index snapshot that covers them is durable on disk
 
 ```
 Before  100 workers × single Mutex →  141k pts/s  P50  69ms  (1,414 req/s)
@@ -194,7 +222,7 @@ single WAL:   all requests → 1 fsync queue         → ceiling = batch_size / 
 16-shard WAL: each request → ≤16 parallel fsyncs   → total wait = max(T_fsync[i])
 ```
 
-Per-shard WAL GC is simpler than the single-WAL case: after each shard flush the sweep calls `wals[i].drain_completed_before(watermarks[i])` immediately — no global `min(watermarks)` synchronisation point needed.
+Per-shard WAL GC is simpler than the single-WAL case: after each shard flush the sweep calls `wals[i].drain_completed_before(persisted_watermarks[i])`. `persisted_watermarks` advance only after a successful `save_index` fsync, decoupling GC eligibility from flush completion (see Durability section below).
 
 ```
 Before  300 workers × single WAL   → 2,598 req/s → 260k pts/s  P50 113ms
@@ -202,15 +230,6 @@ After   300 workers × 16-shard WAL → 3,411 req/s → 341k pts/s  P50  84ms  (
 ```
 
 The benefit scales with `T_fsync / spawn_overhead`. On APFS (4.5ms) it yields +31%; on a RAM disk (1.3ms) spawn overhead dominates and the gain disappears. Linux NVMe with truly independent devices per shard would approach linear scaling.
-
-### Durability before acknowledgement
-
-Every `Append` RPC waits for the WAL group commit task to call `fsync` before returning `Ok` — the durability guarantee is unchanged, only the mechanism differs. No reply is sent until `sync_all()` has completed for the batch containing that request. On crash recovery, the engine:
-1. Loads the last index snapshot (bincode)
-2. Replays WAL entries with CRC32 verification — stops at the first torn write
-3. Flushes recovered points to a new chunk file
-4. Rotates and deletes stale WAL segments
-5. Only then starts accepting live traffic
 
 ### Read amplification controlled at the index layer
 
@@ -278,6 +297,31 @@ grpcurl -plaintext \
   localhost:50051 \
   storage.v1.StorageService/Query
 ```
+
+Run a load test:
+
+```bash
+# Terminal 1 — start the server (choose one)
+
+# Option A: container
+make up && make logs
+
+# Option B: binary directly (smaller flush threshold exposes WAL GC sooner)
+MICIUS_MEMTABLE_FLUSH_MB=4 \
+MICIUS_WAL_DIR=./data/micius/wal \
+MICIUS_CHUNK_DIR=./data/micius/chunks \
+MICIUS_INDEX_PATH=./data/micius/index.bin \
+MICIUS_GRPC_ADDR=0.0.0.0:50051 \
+MICIUS_METRICS_ADDR=0.0.0.0:9091 \
+  ./target/release/storage-engine
+```
+
+```bash
+# Terminal 2 — run the load test
+make bench-load WORKERS=100 DURATION=30s
+```
+
+`WORKERS` controls concurrent gRPC goroutines; `DURATION` is the wall-clock run window. Results are printed as throughput (pts/s), request rate (req/s), and P50/P95/P99 latencies.
 
 ---
 

@@ -10,6 +10,11 @@ pub struct ChunkIndex {
     /// File sizes keyed by ChunkId — used by the compaction worker to group
     /// chunks by size without opening any files.
     pub chunk_files: HashMap<ChunkId, ChunkMeta>, // Chunk size map per ChunkID
+    /// Per-shard WAL sequence watermarks as of the last snapshot.
+    /// `shard_watermarks[i]` is the highest WAL sequence for shard i that
+    /// has been flushed and included in this snapshot. Empty on first start
+    /// or when loaded from a pre-v2 snapshot — both cases trigger full WAL replay.
+    pub shard_watermarks: Vec<u64>,
 }
 
 impl ChunkIndex {

@@ -30,7 +30,17 @@ pub struct StorageServer {
     pub chunk_writer: Arc<ChunkWriter>,
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
     pub snapshot_path: PathBuf,
-    pub mem_shard_watermarks: Vec<Arc<AtomicU64>>,
+    pub shard_watermarks: Vec<Arc<AtomicU64>>,
+    /// Per-shard WAL watermarks from the last successfully written index snapshot.
+    /// WAL GC is gated on these — not the live `shard_watermarks` — to prevent
+    /// deleting segments not yet covered by a durable on-disk snapshot. Without
+    /// this guard, a crash between flush and snapshot orphans the chunk: the WAL
+    /// that would let recovery reconstruct the index entry is already gone.
+    pub persisted_watermarks: Vec<Arc<AtomicU64>>,
+    /// Monotonically increasing counter incremented once per acknowledged Append RPC.
+    /// Returned as `AppendResponse.sequence` — an opaque token clients can use to
+    /// detect out-of-order acks or as a deduplication key. Not a WAL position.
+    pub append_seq: Arc<AtomicU64>,
 }
 
 impl StorageServer {
@@ -49,9 +59,9 @@ impl StorageServer {
         // 1. Index snapshot ─────────────────────────────────────────────────
         // None = first run or missing snapshot → start from empty index.
         // shard recovers its own WAL independently using its own last_sequence.
-        let (mut idx, _) = match index::persistence::load_index(&config.index_path).await? {
-            None => (ChunkIndex::new(), 0),
-            Some((idx, seq)) => (idx, seq),
+        let mut idx = match index::persistence::load_index(&config.index_path).await? {
+            None => ChunkIndex::new(),
+            Some(idx) => idx,
         };
         tracing::info!(
             series = idx.series_count(),
@@ -64,17 +74,23 @@ impl StorageServer {
         // and task spawning are done independently per shard in the same loop.
         // Watermarks are initialised to 0 — the first flush of each shard
         // advances them, and WAL GC only runs after that.
-        let mut wals: Vec<WalSender> = Vec::with_capacity(config.memtable_shards);
-        for i in 0..config.memtable_shards {
+        let mut wals: Vec<WalSender> = Vec::with_capacity(config.num_shards);
+        for i in 0..config.num_shards {
             let shard_dir = config.wal_dir.join(format!("shard-{:02}", i));
-            let recovery = wal::recovery::recover(&shard_dir).await?;
+            // Per-shard watermark: highest WAL sequence confirmed present in the
+            // index snapshot. Segments whose max_seq ≤ watermark are already in
+            // chunk files and safe to delete without replaying.
+            let shard_watermark = idx.shard_watermarks.get(i).copied().unwrap_or(0);
+            let recovery = wal::recovery::recover(&shard_dir, shard_watermark).await?;
             tracing::info!(
                 shard = i,
                 points = recovery.points.len(),
+                watermark = shard_watermark,
                 "WAL shard recovered"
             );
 
-            if !recovery.points.is_empty() {
+            let recoverable = !recovery.points.is_empty();
+            if recoverable {
                 let mut memtable = Memtable::new(config.memtable_flush_threshold_bytes);
                 for point in recovery.points {
                     memtable.insert(point);
@@ -98,7 +114,17 @@ impl StorageServer {
             if recovery.segments_replayed > 0 {
                 writer.rotate().await?;
             }
-            let to_delete = writer.drain_completed_before(u64::MAX);
+
+            // If we replayed WAL data and wrote a recovery chunk, all entries up to
+            // last_sequence are now in chunk files — drain everything replayed.
+            // If no replay was needed, only drain segments already covered by the
+            // snapshot watermark; entries after the watermark are not yet in chunks.
+            let drain_threshold = if recoverable {
+                recovery.last_sequence
+            } else {
+                shard_watermark
+            };
+            let to_delete = writer.drain_completed_before(drain_threshold);
             let mut deleted = 0usize;
             for path in &to_delete {
                 if let Err(e) = tokio::fs::remove_file(path).await {
@@ -121,6 +147,13 @@ impl StorageServer {
                 config.wal_batch_delay_us,
             ));
         }
+        // Extract persisted watermarks before idx is moved into the Arc.
+        // These are already durably on disk (they came from the snapshot); WAL GC
+        // is gated on them so segments are never deleted ahead of the snapshot.
+        let initial_persisted: Vec<u64> = (0..config.num_shards)
+            .map(|i| idx.shard_watermarks.get(i).copied().unwrap_or(0))
+            .collect();
+
         let index = Arc::new(RwLock::new(idx));
         let writer = Arc::new(ChunkWriter::new(&config.chunk_dir));
 
@@ -130,15 +163,19 @@ impl StorageServer {
             config.compaction_min_threshold,
             config.compaction_size_ratio,
         )));
-        let memtables: Vec<Arc<Mutex<Memtable>>> = (0..config.memtable_shards)
+        let memtables: Vec<Arc<Mutex<Memtable>>> = (0..config.num_shards)
             .map(|_| {
                 Arc::new(Mutex::new(Memtable::new(
-                    config.memtable_flush_threshold_bytes / config.memtable_shards,
+                    config.memtable_flush_threshold_bytes / config.num_shards,
                 )))
             })
             .collect();
-        let watermarks: Vec<Arc<AtomicU64>> = (0..config.memtable_shards)
+        let watermarks: Vec<Arc<AtomicU64>> = (0..config.num_shards)
             .map(|_| Arc::new(AtomicU64::new(0u64)))
+            .collect();
+        let persisted_watermarks: Vec<Arc<AtomicU64>> = initial_persisted
+            .into_iter()
+            .map(|v| Arc::new(AtomicU64::new(v)))
             .collect();
         Ok(Self {
             wals,
@@ -147,7 +184,9 @@ impl StorageServer {
             chunk_writer: writer,
             compaction_worker,
             snapshot_path: config.index_path.clone(),
-            mem_shard_watermarks: watermarks,
+            shard_watermarks: watermarks,
+            persisted_watermarks,
+            append_seq: Arc::new(AtomicU64::new(0)),
         })
     }
 }
@@ -216,9 +255,10 @@ impl StorageService for StorageServer {
             })
             .collect();
 
-        let mut max_seq = 0u64;
+        // Drain WAL task results — we only care about errors, not the per-shard
+        // sequence numbers (which are on incomparable scales across shards).
         for handle in handles {
-            let seq = handle
+            handle
                 .await
                 .map_err(|_| Status::internal("WAL task panicked"))?
                 .map_err(|e| {
@@ -227,7 +267,6 @@ impl StorageService for StorageServer {
                         .inc();
                     Status::internal(format!("WAL error: {}", e))
                 })?;
-            max_seq = max_seq.max(seq);
         }
 
         // ── Step 4: Memtable inserts ──────────────────────────────────────────
@@ -247,8 +286,12 @@ impl StorageService for StorageServer {
             .with_label_values(&["ok"])
             .inc();
 
-        tracing::info!(points = pts.len(), seq = max_seq, "append");
-        Ok(Response::new(AppendResponse { sequence: max_seq }))
+        // Global append counter: strictly monotonic across all shards, safe to
+        // compare across consecutive RPCs. Relaxed ordering is sufficient — this
+        // counter does not synchronize any payload data.
+        let seq = self.append_seq.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::info!(points = pts.len(), seq, "append");
+        Ok(Response::new(AppendResponse { sequence: seq }))
     }
 
     type QueryStream = ReceiverStream<Result<QueryResponse, Status>>;
@@ -452,19 +495,24 @@ impl StorageService for StorageServer {
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotResponse>, Status> {
         tracing::info!("snapshot");
-        let seq = self
-            .mem_shard_watermarks
+        let watermarks: Vec<u64> = self
+            .shard_watermarks
             .iter()
             .map(|w| w.load(Ordering::Acquire))
-            .max()
-            .unwrap_or(0);
+            .collect();
         let index = self.index.read().await;
 
-        crate::index::persistence::save_index(&index, &self.snapshot_path, seq)
+        crate::index::persistence::save_index(&index, &self.snapshot_path, &watermarks)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
-        tracing::info!(seq, path = %self.snapshot_path.display(), "snapshot saved");
+        // Snapshot is durable — advance persisted watermarks so WAL GC may now
+        // delete segments up to these positions without risking data loss on crash.
+        for (pw, &w) in self.persisted_watermarks.iter().zip(watermarks.iter()) {
+            pw.store(w, Ordering::Release);
+        }
+
+        tracing::info!(path = %self.snapshot_path.display(), "snapshot saved");
         Ok(Response::new(SnapshotResponse {
             snapshot_path: self.snapshot_path.to_string_lossy().into_owned(),
         }))
@@ -489,13 +537,13 @@ impl StorageServer {
     ///  │  ┌────────┴────────────────────┴──────────────────────┴───────────┐ │
     ///  │  │              Arc shared state                                  │ │
     ///  │  │  WalSender · Vec<Arc<Mutex<Memtable>>> · Arc<RwLock<ChunkIdx>> │ │
-    ///  │  │  Arc<ChunkWriter> · Vec<Arc<AtomicU64>> (shard watermarks)     │ │
-    ///  │  └────────────────────────────────────────────────────────────────┘ │
+    ///  │  Arc<ChunkWriter> · Vec<Arc<AtomicU64>> (live + persisted wmarks) │ │
+    ///  └────────────────────────────────────────────────────────────────────┘ │
     ///  │           │                                                         │
     ///  │  ┌────────┴───────────────────────────────────────────────────────┐ │
     ///  │  │  Memtable sweep + WAL GC  (every 200ms)                        │ │
     ///  │  │  for each shard: drain → ChunkWriter → Index write → watermark │ │
-    ///  │  │  then: min(watermarks) → WalSender::drain_completed_before     │ │
+    ///  │  │  WAL GC gated on persisted_watermarks[i] (last durable snap)   │ │
     ///  │  └────────────────────────────────────────────────────────────────┘ │
     ///  │           │                                                         │
     ///  │  ┌────────┴───────────────────────────────────────────────────────┐ │
@@ -535,21 +583,30 @@ impl StorageServer {
         {
             let idx_clone = Arc::clone(&self.index);
             let watermarks: Vec<Arc<AtomicU64>> =
-                self.mem_shard_watermarks.iter().map(Arc::clone).collect();
+                self.shard_watermarks.iter().map(Arc::clone).collect();
+            let persisted: Vec<Arc<AtomicU64>> =
+                self.persisted_watermarks.iter().map(Arc::clone).collect();
             let index_path = self.snapshot_path.clone();
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(60));
                 loop {
                     ticker.tick().await;
-                    let seq = watermarks
+                    let current_watermarks: Vec<u64> = watermarks
                         .iter()
                         .map(|w| w.load(Ordering::Acquire))
-                        .max()
-                        .unwrap_or(0);
+                        .collect();
 
                     let index = idx_clone.read().await;
-                    if let Err(e) = index::persistence::save_index(&index, &index_path, seq).await {
-                        tracing::error!(error = %e, "periodic index snapshot failed");
+                    match index::persistence::save_index(&index, &index_path, &current_watermarks)
+                        .await
+                    {
+                        Err(e) => tracing::error!(error = %e, "periodic index snapshot failed"),
+                        Ok(()) => {
+                            // Snapshot is durable — unblock WAL GC up to these positions.
+                            for (pw, &w) in persisted.iter().zip(current_watermarks.iter()) {
+                                pw.store(w, Ordering::Release);
+                            }
+                        }
                     }
                     // index read lock released here (RwLockReadGuard dropped)
                 }
@@ -564,7 +621,9 @@ impl StorageServer {
             let index = Arc::clone(&self.index);
             let wals: Vec<WalSender> = self.wals.clone();
             let watermarks: Vec<Arc<AtomicU64>> =
-                self.mem_shard_watermarks.iter().map(Arc::clone).collect();
+                self.shard_watermarks.iter().map(Arc::clone).collect();
+            let persisted_watermarks: Vec<Arc<AtomicU64>> =
+                self.persisted_watermarks.iter().map(Arc::clone).collect();
 
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(200));
@@ -623,9 +682,15 @@ impl StorageServer {
                                     let seq = wals[i].current_sequence();
                                     watermarks[i].store(seq, Ordering::Release);
 
-                                    match wals[i].drain_completed_before(seq).await {
+                                    // Gate WAL GC on the persisted watermark (last durable
+                                    // snapshot), not the live seq. Deleting a segment before
+                                    // its snapshot is on disk would orphan the chunk on crash:
+                                    // no WAL to replay, chunk not in the index → unqueryable.
+                                    let gc_seq = persisted_watermarks[i].load(Ordering::Acquire);
+                                    match wals[i].drain_completed_before(gc_seq).await {
                                         Ok(paths) => {
                                             let mut deleted = 0usize;
+
                                             for path in &paths {
                                                 if let Err(e) = tokio::fs::remove_file(path).await {
                                                     // NotFound is benign — cleaned up by a previous run.
@@ -642,7 +707,7 @@ impl StorageServer {
                                             } else if deleted > 0 {
                                                 tracing::info!(
                                                     deleted,
-                                                    seq,
+                                                    gc_seq,
                                                     "WAL segments cleaned up"
                                                 );
                                             }

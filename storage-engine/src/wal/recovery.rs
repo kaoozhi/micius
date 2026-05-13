@@ -27,7 +27,10 @@ pub fn get_wal_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-pub async fn recover(wal_dir: &Path) -> Result<RecoveryResult> {
+/// Replays WAL segments in `wal_dir`, skipping entries whose sequence is
+/// already covered by `snapshot_watermark` (i.e. already in chunk files).
+/// Pass `0` to replay everything (first start or missing snapshot).
+pub async fn recover(wal_dir: &Path, snapshot_watermark: u64) -> Result<RecoveryResult> {
     let mut result = RecoveryResult {
         points: Vec::new(),
         last_sequence: 0,
@@ -75,10 +78,20 @@ pub async fn recover(wal_dir: &Path) -> Result<RecoveryResult> {
 
             // Now good to decode WalEntry proto and collect DataPoints
             let entry = WalEntry::decode(payload)?;
-            let points: Vec<DataPoint> = entry.points.into_iter().map(Into::into).collect();
-            result.points.extend_from_slice(&points);
+            // Skip points already captured in the index snapshot — no need to
+            // re-flush data that is already in chunk files.
+            if entry.sequence <= snapshot_watermark {
+                continue;
+            }
+            // Track the highest sequence among entries that need to be replayed.
+            // Used as the drain_completed_before threshold after the recovery chunk
+            // is written — segments up to this sequence are safe to delete.
+            // When all entries are below the watermark (points is empty), the caller
+            // uses shard_watermark as the drain threshold instead.
             result.last_sequence = result.last_sequence.max(entry.sequence);
             result.entries_replayed += 1;
+            let points: Vec<DataPoint> = entry.points.into_iter().map(Into::into).collect();
+            result.points.extend_from_slice(&points);
         }
         result.segments_replayed += 1;
     }
