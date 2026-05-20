@@ -8,6 +8,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+/// Background size-tiered compaction worker — groups same-size chunks and merges them.#[derive(Debug)]
+#[derive(Debug)]
 pub struct CompactionWorker {
     index: Arc<RwLock<ChunkIndex>>,
     writer: Arc<ChunkWriter>,
@@ -15,8 +17,12 @@ pub struct CompactionWorker {
     size_ratio: f64,      // max/min file size ratio within a merge group
 }
 
+/// Summary returned by a single compaction cycle.
+#[derive(Debug)]
 pub struct CompactionResult {
+    /// Number of old chunk files consumed.
     pub chunks_merged: u32,
+    /// Net bytes reclaimed on disk after writing the merged chunk.
     pub bytes_freed: u64,
 }
 
@@ -27,6 +33,7 @@ struct MergeGroup {
 }
 
 impl CompactionWorker {
+    /// Creates a new compaction worker. `size_ratio` must be ≥ 1.0.
     pub fn new(
         index: Arc<RwLock<ChunkIndex>>,
         writer: Arc<ChunkWriter>,
@@ -99,6 +106,7 @@ impl CompactionWorker {
             .collect()
     }
 
+    #[allow(clippy::indexing_slicing)] // vec[pos] in Ok arm: binary_search guarantees pos is a valid existing index
     async fn merge_group(&self, group: &MergeGroup) -> Result<ChunkWriteResult> {
         let mut entries: BTreeMap<SeriesKey, Vec<(i64, f64)>> = BTreeMap::new();
         for (_, path) in group.chunks.iter() {
@@ -147,6 +155,7 @@ impl CompactionWorker {
         Ok(result)
     }
 
+    /// Runs one compaction cycle — finds candidates, merges each group, deletes old files.
     pub async fn compact_once(&self) -> Result<CompactionResult> {
         let mut old_bytes: u64 = 0;
         let candidates = {

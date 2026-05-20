@@ -1,3 +1,7 @@
+//! ChunkReader — decompress and decode chunk files, filter by series and time range.
+
+/// Reads data points from `.mcs` chunk files.
+#[derive(Debug)]
 pub struct ChunkReader;
 use crate::chunk::format::*;
 use crate::types::*;
@@ -7,11 +11,30 @@ use crc32fast::Hasher as CrcHasher;
 use lz4_flex::block::decompress_size_prepended;
 use std::path::Path;
 
+/// Returns `bytes[offset..offset+len]` or an error if the range exceeds the buffer.
+fn slice(bytes: &[u8], offset: usize, len: usize) -> Result<&[u8]> {
+    bytes.get(offset..offset + len).ok_or_else(|| {
+        anyhow::anyhow!(
+            "chunk file truncated: need {} bytes at offset {}, file is {} bytes",
+            len,
+            offset,
+            bytes.len()
+        )
+    })
+}
+
 impl ChunkReader {
+    /// Returns `true` if `series_key` is possibly present in this chunk according to its bloom filter.
+    /// A `false` result is a definitive miss — no data for this series in the file.
     pub async fn check_bloom(path: &Path, series_key: &SeriesKey) -> Result<bool> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
         let mut file = tokio::fs::File::open(path).await?;
         let file_size = file.metadata().await?.len() as usize;
+        anyhow::ensure!(
+            file_size >= FOOTER_TAIL_SIZE,
+            "chunk file too small to contain footer: {} bytes",
+            file_size
+        );
         // Read the last FOOTER_TAIL_SIZE(12) bytes: [footer_offset: u64][checksum: u32]
         file.seek(tokio::io::SeekFrom::Start(
             (file_size - FOOTER_TAIL_SIZE) as u64,
@@ -19,7 +42,9 @@ impl ChunkReader {
         .await?;
         let mut tail = [0u8; FOOTER_TAIL_SIZE];
         file.read_exact(&mut tail).await?;
-        let footer_offset = u64::from_le_bytes(tail[..FOOTER_OFFSET_SIZE].try_into()?) as usize;
+        // split_at on a fixed-size stack array — always in bounds
+        let (footer_bytes, _) = tail.split_at(FOOTER_OFFSET_SIZE);
+        let footer_offset = u64::from_le_bytes(footer_bytes.try_into()?) as usize;
 
         // Read bloom section from footer_offset to end of bloom data
         anyhow::ensure!(
@@ -79,6 +104,8 @@ impl ChunkReader {
         Ok(Some(data))
     }
 
+    /// Reads all data points from a chunk file regardless of series or time range.
+    /// Used by the compaction worker to merge all series from multiple chunks.
     pub async fn read_chunk(path: &Path) -> Result<Vec<DataPoint>> {
         let bytes = tokio::fs::read(path).await?;
 
@@ -90,16 +117,15 @@ impl ChunkReader {
         let mut cursor = HEADER_SIZE;
 
         for _ in 0..header.series_count {
-            let key_len = u32::from_le_bytes(bytes[cursor..cursor + U32_SIZE].try_into()?) as usize;
-            let key_bytes = &bytes[cursor + U32_SIZE..cursor + U32_SIZE + key_len];
+            let key_len = u32::from_le_bytes(slice(&bytes, cursor, U32_SIZE)?.try_into()?) as usize;
+            let key_bytes = slice(&bytes, cursor + U32_SIZE, key_len)?;
             let series_key = SeriesKey::from_bytes(key_bytes)?;
             // Entry layout: [key_len: u32][key_bytes][entry_count: u32][ts_offset: u64][val_offset: u64]...
             let ts_cursor = cursor + U32_SIZE + key_len + U32_SIZE;
-            let ts_col_offset =
-                u64::from_le_bytes(bytes[ts_cursor..ts_cursor + U64_SIZE].try_into()?);
+            let ts_col_offset = u64::from_le_bytes(slice(&bytes, ts_cursor, U64_SIZE)?.try_into()?);
             let val_cursor = ts_cursor + U64_SIZE;
             let val_col_offset =
-                u64::from_le_bytes(bytes[val_cursor..val_cursor + U64_SIZE].try_into()?);
+                u64::from_le_bytes(slice(&bytes, val_cursor, U64_SIZE)?.try_into()?);
             let series = retrieve_data(
                 &bytes,
                 &series_key,
@@ -119,10 +145,17 @@ impl ChunkReader {
 }
 
 fn is_checksum_valid(bytes: &[u8]) -> Result<()> {
+    anyhow::ensure!(
+        bytes.len() >= CHECKSUM_SIZE,
+        "chunk file too small to contain checksum: {} bytes",
+        bytes.len()
+    );
+    // split_at is safe: ensure above guarantees bytes.len() >= CHECKSUM_SIZE
+    let (data, stored) = bytes.split_at(bytes.len() - CHECKSUM_SIZE);
     let mut crc = CrcHasher::new();
-    crc.update(&bytes[..bytes.len() - CHECKSUM_SIZE]);
+    crc.update(data);
     let computed_checksum = crc.finalize();
-    let stored_checksum = u32::from_le_bytes(bytes[bytes.len() - CHECKSUM_SIZE..].try_into()?);
+    let stored_checksum = u32::from_le_bytes(stored.try_into()?);
     anyhow::ensure!(
         computed_checksum == stored_checksum,
         "CRC32 mismatch: computed 0x{:08X}, stored 0x{:08X}",
@@ -133,7 +166,7 @@ fn is_checksum_valid(bytes: &[u8]) -> Result<()> {
 }
 
 fn is_magic_valid(bytes: &[u8]) -> Result<()> {
-    let magic = u32::from_le_bytes(bytes[0..4].try_into()?);
+    let magic = u32::from_le_bytes(slice(bytes, 0, 4)?.try_into()?);
     anyhow::ensure!(
         magic == MAGIC,
         "Invalid chunk magic: expected 0x{:08X}, got 0x{:08X}",
@@ -153,15 +186,17 @@ fn parse_header(bytes: &[u8]) -> Result<ChunkHeader> {
         "file too small to contain header"
     );
     Ok(ChunkHeader {
-        magic: u32::from_le_bytes(bytes[0..4].try_into()?),
-        version: bytes[4],
-        _padding: bytes[5..8].try_into()?,
-        chunk_id: u64::from_le_bytes(bytes[8..16].try_into()?),
-        time_start_ns: i64::from_le_bytes(bytes[16..24].try_into()?),
-        time_end_ns: i64::from_le_bytes(bytes[24..32].try_into()?),
-        series_count: u32::from_le_bytes(bytes[32..36].try_into()?),
-        total_entries: u32::from_le_bytes(bytes[36..40].try_into()?),
-        col_data_offset: u64::from_le_bytes(bytes[40..48].try_into()?),
+        magic: u32::from_le_bytes(slice(bytes, 0, 4)?.try_into()?),
+        version: *slice(bytes, 4, 1)?
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("missing version byte"))?,
+        _padding: slice(bytes, 5, 3)?.try_into()?,
+        chunk_id: u64::from_le_bytes(slice(bytes, 8, 8)?.try_into()?),
+        time_start_ns: i64::from_le_bytes(slice(bytes, 16, 8)?.try_into()?),
+        time_end_ns: i64::from_le_bytes(slice(bytes, 24, 8)?.try_into()?),
+        series_count: u32::from_le_bytes(slice(bytes, 32, 4)?.try_into()?),
+        total_entries: u32::from_le_bytes(slice(bytes, 36, 4)?.try_into()?),
+        col_data_offset: u64::from_le_bytes(slice(bytes, 40, 8)?.try_into()?),
     })
 }
 
@@ -173,29 +208,29 @@ fn parse_bloom_from_buf(bloom_buf: &[u8]) -> Result<Bloom<Vec<u8>>> {
         cursor,
         bloom_buf.len()
     );
-    let bitmap_bits = u64::from_le_bytes(bloom_buf[cursor..cursor + U64_SIZE].try_into()?);
+    let bitmap_bits = u64::from_le_bytes(slice(bloom_buf, cursor, U64_SIZE)?.try_into()?);
     cursor += U64_SIZE;
-    let k_num = u32::from_le_bytes(bloom_buf[cursor..cursor + U32_SIZE].try_into()?);
+    let k_num = u32::from_le_bytes(slice(bloom_buf, cursor, U32_SIZE)?.try_into()?);
     cursor += U32_SIZE;
     let sip_keys = [
         (
-            u64::from_le_bytes(bloom_buf[cursor..cursor + U64_SIZE].try_into()?),
-            u64::from_le_bytes(bloom_buf[cursor + U64_SIZE..cursor + 2 * U64_SIZE].try_into()?),
+            u64::from_le_bytes(slice(bloom_buf, cursor, U64_SIZE)?.try_into()?),
+            u64::from_le_bytes(slice(bloom_buf, cursor + U64_SIZE, U64_SIZE)?.try_into()?),
         ),
         (
-            u64::from_le_bytes(bloom_buf[cursor + 2 * U64_SIZE..cursor + 3 * U64_SIZE].try_into()?),
-            u64::from_le_bytes(bloom_buf[cursor + 3 * U64_SIZE..cursor + 4 * U64_SIZE].try_into()?),
+            u64::from_le_bytes(slice(bloom_buf, cursor + 2 * U64_SIZE, U64_SIZE)?.try_into()?),
+            u64::from_le_bytes(slice(bloom_buf, cursor + 3 * U64_SIZE, U64_SIZE)?.try_into()?),
         ),
     ];
     cursor += BLOOM_SIP_KEYS_SIZE;
-    let bloom_len = u32::from_le_bytes(bloom_buf[cursor..cursor + U32_SIZE].try_into()?) as usize;
+    let bloom_len = u32::from_le_bytes(slice(bloom_buf, cursor, U32_SIZE)?.try_into()?) as usize;
     cursor += U32_SIZE;
     anyhow::ensure!(
         cursor + bloom_len <= bloom_buf.len(),
         "bloom bitmap extends beyond file bounds"
     );
     Ok(Bloom::from_existing(
-        &bloom_buf[cursor..cursor + bloom_len],
+        slice(bloom_buf, cursor, bloom_len)?,
         bitmap_bits,
         k_num,
         sip_keys,
@@ -214,17 +249,14 @@ fn find_series(
     let key_bytes = series_key.to_bytes();
     let mut cursor = HEADER_SIZE;
     for _ in 0..series_count {
-        let key_len = u32::from_le_bytes(bytes[cursor..cursor + U32_SIZE].try_into()?) as usize;
-        if key_bytes.len() == key_len
-            && key_bytes == bytes[cursor + U32_SIZE..cursor + U32_SIZE + key_len]
-        {
+        let key_len = u32::from_le_bytes(slice(bytes, cursor, U32_SIZE)?.try_into()?) as usize;
+        if key_bytes.len() == key_len && key_bytes == slice(bytes, cursor + U32_SIZE, key_len)? {
             // Entry layout: [key_len: u32][key_bytes][entry_count: u32][ts_offset: u64][val_offset: u64]...
             let ts_cursor = cursor + U32_SIZE + key_len + U32_SIZE;
-            let ts_col_offset =
-                u64::from_le_bytes(bytes[ts_cursor..ts_cursor + U64_SIZE].try_into()?);
+            let ts_col_offset = u64::from_le_bytes(slice(bytes, ts_cursor, U64_SIZE)?.try_into()?);
             let val_cursor = ts_cursor + U64_SIZE;
             let val_col_offset =
-                u64::from_le_bytes(bytes[val_cursor..val_cursor + U64_SIZE].try_into()?);
+                u64::from_le_bytes(slice(bytes, val_cursor, U64_SIZE)?.try_into()?);
             return Ok(Some((ts_col_offset as usize, val_col_offset as usize)));
         }
         // DIR_ENTRY_FIXED_SIZE includes the key_len u32 field itself plus all other fixed fields.
@@ -245,25 +277,21 @@ fn retrieve_data(
     time_start_ns: Option<i64>,
     time_end_ns: Option<i64>,
 ) -> Result<Vec<DataPoint>> {
-    let ts_len =
-        u32::from_le_bytes(bytes[ts_offset..ts_offset + COL_LEN_SIZE].try_into()?) as usize;
-    let ts_decompressed = decompress_size_prepended(
-        &bytes[ts_offset + COL_LEN_SIZE..ts_offset + COL_LEN_SIZE + ts_len],
-    )?;
-    let val_len =
-        u32::from_le_bytes(bytes[val_offset..val_offset + COL_LEN_SIZE].try_into()?) as usize;
-    let val_decompressed = decompress_size_prepended(
-        &bytes[val_offset + COL_LEN_SIZE..val_offset + COL_LEN_SIZE + val_len],
-    )?;
+    let ts_len = u32::from_le_bytes(slice(bytes, ts_offset, COL_LEN_SIZE)?.try_into()?) as usize;
+    let ts_decompressed =
+        decompress_size_prepended(slice(bytes, ts_offset + COL_LEN_SIZE, ts_len)?)?;
+    let val_len = u32::from_le_bytes(slice(bytes, val_offset, COL_LEN_SIZE)?.try_into()?) as usize;
+    let val_decompressed =
+        decompress_size_prepended(slice(bytes, val_offset + COL_LEN_SIZE, val_len)?)?;
     // Both columns must have the same number of entries — enforced by the writer.
     anyhow::ensure!(
         val_decompressed.len() == ts_decompressed.len(),
         "length mismatch between timestamp and value columns"
     );
 
-    let ts_deltas = bytes_to_i64_slice(&ts_decompressed);
+    let ts_deltas = bytes_to_i64_slice(&ts_decompressed)?;
     let ts_decoded = delta_decode(&ts_deltas);
-    let val_decoded = bytes_to_f64_slice(&val_decompressed);
+    let val_decoded = bytes_to_f64_slice(&val_decompressed)?;
 
     let points: Vec<DataPoint> = ts_decoded
         .into_iter()

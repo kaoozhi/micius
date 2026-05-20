@@ -8,14 +8,22 @@ use std::path::PathBuf;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 
+/// Output of replaying one WAL shard directory.
+#[derive(Debug)]
 pub struct RecoveryResult {
+    /// Data points recovered from WAL entries above the snapshot watermark.
     pub points: Vec<DataPoint>,
+    /// Highest sequence number seen during replay — used as the flush drain threshold.
     pub last_sequence: u64,
+    /// Number of segment files opened and scanned.
     pub segments_replayed: u32,
+    /// Number of WAL entries decoded (excluding watermark-skipped entries).
     pub entries_replayed: u64,
+    /// `true` if a CRC mismatch or truncated frame stopped the replay early.
     pub torn_write_detected: bool,
 }
 
+/// Returns all `.wal` segment files in `dir`, sorted by name (which sorts chronologically).
 pub fn get_wal_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .context("failed to read WAL directory")?
@@ -30,6 +38,7 @@ pub fn get_wal_files(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Replays WAL segments in `wal_dir`, skipping entries whose sequence is
 /// already covered by `snapshot_watermark` (i.e. already in chunk files).
 /// Pass `0` to replay everything (first start or missing snapshot).
+#[allow(clippy::indexing_slicing)] // buf[cursor..cursor+4/8] and buf[cursor..cursor+len]: all guarded by preflight checks at lines 59 and 65
 pub async fn recover(wal_dir: &Path, snapshot_watermark: u64) -> Result<RecoveryResult> {
     let mut result = RecoveryResult {
         points: Vec::new(),

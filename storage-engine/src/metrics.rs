@@ -8,6 +8,7 @@ use prometheus::{
 
 // ── WAL ───────────────────────────────────────────────────────────────────────
 
+/// Histogram of WAL append + fsync duration in seconds, labelled by result.
 pub fn wal_append_duration() -> &'static HistogramVec {
     static M: OnceLock<HistogramVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -23,6 +24,7 @@ pub fn wal_append_duration() -> &'static HistogramVec {
     })
 }
 
+/// Counter of total WAL batches written, labelled by result.
 pub fn wal_entries_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -36,6 +38,7 @@ pub fn wal_entries_total() -> &'static IntCounterVec {
 
 // ── Memtable ──────────────────────────────────────────────────────────────────
 
+/// Gauge tracking current total memtable size across all shards in bytes.
 pub fn memtable_size_bytes() -> &'static IntGauge {
     static M: OnceLock<IntGauge> = OnceLock::new();
     M.get_or_init(|| {
@@ -47,6 +50,7 @@ pub fn memtable_size_bytes() -> &'static IntGauge {
     })
 }
 
+/// Counter of total memtable flushes, labelled by result.
 pub fn memtable_flush_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -58,6 +62,7 @@ pub fn memtable_flush_total() -> &'static IntCounterVec {
     })
 }
 
+/// Histogram of time taken to flush a memtable shard to a chunk file.
 pub fn memtable_flush_duration_seconds() -> &'static Histogram {
     static M: OnceLock<Histogram> = OnceLock::new();
     M.get_or_init(|| {
@@ -74,6 +79,7 @@ pub fn memtable_flush_duration_seconds() -> &'static Histogram {
 
 // ── Chunk store ───────────────────────────────────────────────────────────────
 
+/// Gauge tracking the total number of chunk files on disk.
 pub fn chunk_files_total() -> &'static IntGauge {
     static M: OnceLock<IntGauge> = OnceLock::new();
     M.get_or_init(|| {
@@ -85,6 +91,7 @@ pub fn chunk_files_total() -> &'static IntGauge {
     })
 }
 
+/// Counter of total bytes written to chunk files since process start.
 pub fn chunk_bytes_written_total() -> &'static IntCounter {
     static M: OnceLock<IntCounter> = OnceLock::new();
     M.get_or_init(|| {
@@ -98,6 +105,7 @@ pub fn chunk_bytes_written_total() -> &'static IntCounter {
 
 // ── Query ─────────────────────────────────────────────────────────────────────
 
+/// Histogram of end-to-end query latency in seconds.
 pub fn query_duration_seconds() -> &'static Histogram {
     static M: OnceLock<Histogram> = OnceLock::new();
     M.get_or_init(|| {
@@ -133,6 +141,7 @@ pub fn query_chunks_scanned() -> &'static HistogramVec {
 
 // ── Index ─────────────────────────────────────────────────────────────────────
 
+/// Gauge tracking the number of distinct time series in the chunk index.
 pub fn index_series_count() -> &'static IntGauge {
     static M: OnceLock<IntGauge> = OnceLock::new();
     M.get_or_init(|| {
@@ -146,6 +155,7 @@ pub fn index_series_count() -> &'static IntGauge {
 
 // ── Compaction ────────────────────────────────────────────────────────────────
 
+/// Counter of total compaction cycles run, labelled by result.
 pub fn compaction_runs_total() -> &'static IntCounterVec {
     static M: OnceLock<IntCounterVec> = OnceLock::new();
     M.get_or_init(|| {
@@ -157,6 +167,7 @@ pub fn compaction_runs_total() -> &'static IntCounterVec {
     })
 }
 
+/// Counter of total chunk files consumed by compaction since process start.
 pub fn compaction_chunks_merged_total() -> &'static IntCounter {
     static M: OnceLock<IntCounter> = OnceLock::new();
     M.get_or_init(|| {
@@ -174,7 +185,7 @@ async fn metrics_handler() -> impl axum::response::IntoResponse {
     let encoder = prometheus::TextEncoder::new();
     let metric_families = prometheus::gather();
     let mut body = Vec::new();
-    let _ = encoder.encode(&metric_families, &mut body);
+    encoder.encode(&metric_families, &mut body).ok();
     (
         [(
             axum::http::header::CONTENT_TYPE,

@@ -3,6 +3,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Runtime configuration loaded from environment variables.
+#[derive(Debug)]
 pub struct StorageConfig {
     /// Directory for WAL segment files
     pub wal_dir: PathBuf,
@@ -64,6 +66,7 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
+    /// Loads configuration from environment variables, falling back to defaults.
     pub fn load() -> Result<Self> {
         let num_shards = env_usize("MICIUS_NUM_SHARDS", 16);
         anyhow::ensure!(
@@ -89,6 +92,7 @@ impl StorageConfig {
         })
     }
 
+    /// Creates WAL shard directories, chunk directory, and index parent directory if missing.
     pub async fn ensure_dirs(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.wal_dir).await?;
         for i in 0..self.num_shards {
@@ -134,6 +138,7 @@ fn env_string(key: &str, default: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 

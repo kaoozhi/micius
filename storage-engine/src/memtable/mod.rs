@@ -3,6 +3,8 @@ use crate::types::{DataPoint, SeriesKey, ValuePredicate, series_id_from_parts};
 use std::collections::{BTreeMap, HashMap};
 use std::mem::size_of;
 
+/// In-memory write buffer — sorted by series key, flushed to chunk files when threshold is reached.
+#[derive(Debug)]
 pub struct Memtable {
     entries: BTreeMap<SeriesKey, Vec<(i64, f64)>>,
     size_bytes: usize,
@@ -11,6 +13,7 @@ pub struct Memtable {
 }
 
 impl Memtable {
+    /// Creates a new memtable that flushes when it exceeds `threshold` bytes.
     pub fn new(threshold: usize) -> Self {
         Memtable {
             entries: BTreeMap::new(),
@@ -20,6 +23,8 @@ impl Memtable {
         }
     }
 
+    /// Inserts a data point, maintaining sorted timestamp order per series. Deduplicates by timestamp.
+    #[allow(clippy::indexing_slicing)] // vec[pos] in Ok arm: binary_search guarantees pos is a valid existing index
     pub fn insert(&mut self, point: DataPoint) {
         let key = SeriesKey {
             metric_name: point.metric_name,
@@ -49,28 +54,34 @@ impl Memtable {
         }
     }
 
+    /// Returns `true` when the estimated size meets or exceeds the flush threshold.
     pub fn should_flush(&self) -> bool {
         self.size_bytes >= self.flush_threshold
     }
 
+    /// Returns the current estimated memory footprint in bytes.
     pub fn size_bytes(&self) -> usize {
         self.size_bytes
     }
 
+    /// Returns `true` if the memtable holds no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Returns the total number of data points stored.
     pub fn entry_count(&self) -> u64 {
         self.entry_count
     }
 
+    /// Drains all entries and resets size tracking. Returns the data for flushing to a chunk file.
     pub fn drain(&mut self) -> BTreeMap<SeriesKey, Vec<(i64, f64)>> {
         self.size_bytes = 0usize;
         self.entry_count = 0;
         std::mem::take(&mut self.entries)
     }
 
+    /// Returns all series keys matching `metric` and `tag_filters`.
     pub fn resolve_series(
         &self,
         metric: &str,
@@ -100,6 +111,7 @@ impl Memtable {
             .collect()
     }
 
+    /// Returns data points for `series_key` within `[time_start_ns, time_end_ns]`, filtered by `predicate`.
     pub fn read_series(
         &self,
         series_key: &SeriesKey,
@@ -125,6 +137,7 @@ impl Memtable {
     }
 }
 
+/// Maps a data point to its shard index using xxh64 and a bitmask (`shards` must be a power of 2).
 pub fn shard_index(point: &DataPoint, shards: usize) -> usize {
     let series_id = series_id_from_parts(&point.metric_name, &point.tags);
     // shards is guaranteed to be a power of 2 by StorageConfig::load()

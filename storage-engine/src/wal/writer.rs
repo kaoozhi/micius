@@ -7,12 +7,18 @@ use crate::types::{DataPoint, Sequence};
 use crate::wal::proto::WalEntry;
 use prost::Message;
 
+/// Low-level WAL segment writer — append frames, rotate segments, GC completed segments.
+#[derive(Debug)]
 pub struct WalWriter {
+    /// Currently open segment file.
     pub file: File,
+    /// Sequence number of the last frame written.
     pub current_seq: Sequence,
+    /// Bytes written to the current segment.
     pub current_size: u64,
     current_segment: u64,
     wal_dir: PathBuf,
+    /// Rotate to a new segment once `current_size` reaches this threshold.
     pub max_segment_bytes: u64,
     completed_segments: Vec<(u64, Sequence)>,
 }
@@ -82,6 +88,7 @@ impl WalWriter {
         Ok(self.current_seq)
     }
 
+    /// Encodes points into a WAL frame: `[length: u32][crc32: u32][protobuf payload]`.
     pub fn encode_frame(seq: Sequence, points: &[DataPoint]) -> Vec<u8> {
         let wal_entry = WalEntry {
             sequence: seq,
@@ -108,6 +115,7 @@ impl WalWriter {
         frame
     }
 
+    /// Closes the current segment and opens a new one, recording the old segment as completed.
     pub async fn rotate(&mut self) -> Result<()> {
         self.completed_segments
             .push((self.current_segment, self.current_seq));
@@ -136,6 +144,7 @@ impl WalWriter {
         segment_path(&self.wal_dir, self.current_segment)
     }
 
+    /// Returns paths of completed segments whose max sequence is ≤ `flushed_seq`, removing them from tracking.
     pub fn drain_completed_before(&mut self, flushed_seq: Sequence) -> Vec<PathBuf> {
         let mut to_delete = Vec::new();
         self.completed_segments.retain(|(seg, max_seq)| {

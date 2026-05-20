@@ -23,13 +23,22 @@ use tokio::time::Duration;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+/// gRPC storage server — owns all shared state and spawns background tasks.
+#[derive(Debug)]
 pub struct StorageServer {
+    /// One group-commit WAL sender per shard.
     pub wals: Vec<WalSender>,
+    /// One memtable per shard, each guarded by its own Mutex.
     pub memtables: Vec<Arc<Mutex<Memtable>>>,
+    /// In-memory chunk index shared across all RPCs and background tasks.
     pub index: Arc<RwLock<ChunkIndex>>,
+    /// Writes flushed memtable shards to chunk files on disk.
     pub chunk_writer: Arc<ChunkWriter>,
+    /// Size-tiered compaction worker, run periodically in the background.
     pub compaction_worker: Arc<Mutex<CompactionWorker>>,
+    /// Path where the periodic index snapshot is written.
     pub snapshot_path: PathBuf,
+    /// Live per-shard WAL watermarks — advance after each successful flush.
     pub shard_watermarks: Vec<Arc<AtomicU64>>,
     /// Per-shard WAL watermarks from the last successfully written index snapshot.
     /// WAL GC is gated on these — not the live `shard_watermarks` — to prevent
@@ -193,6 +202,7 @@ impl StorageServer {
 
 #[tonic::async_trait]
 impl StorageService for StorageServer {
+    #[allow(clippy::indexing_slicing)] // indexed[j]: guarded by while j < indexed.len(); indexed[j..end] + pts[idx]: end from partition_point, idx from same slice
     async fn append(
         &self,
         request: Request<AppendRequest>,
@@ -382,7 +392,7 @@ impl StorageService for StorageServer {
                     .collect();
 
                 // Materialise file paths and series keys while the lock is held.
-                let paths: HashMap<ChunkId, std::path::PathBuf> = chunks
+                let paths: HashMap<ChunkId, PathBuf> = chunks
                     .iter()
                     .filter_map(|c| {
                         idx.chunk_files
@@ -502,7 +512,7 @@ impl StorageService for StorageServer {
             .collect();
         let index = self.index.read().await;
 
-        crate::index::persistence::save_index(&index, &self.snapshot_path, &watermarks)
+        index::persistence::save_index(&index, &self.snapshot_path, &watermarks)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
@@ -626,6 +636,8 @@ impl StorageServer {
             let persisted_watermarks: Vec<Arc<AtomicU64>> =
                 self.persisted_watermarks.iter().map(Arc::clone).collect();
 
+            #[allow(clippy::indexing_slicing)]
+            // wals[i]/watermarks[i]/persisted_watermarks[i]: i < num_shards, all Vecs sized num_shards by construction
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_millis(200));
                 loop {

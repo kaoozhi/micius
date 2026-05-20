@@ -4,9 +4,13 @@ use std::path::PathBuf;
 /// A single measurement at a point in time
 #[derive(Debug, Clone, PartialEq)]
 pub struct DataPoint {
+    /// Name of the metric (e.g. `"cpu.load"`).
     pub metric_name: String,
+    /// Tag key-value pairs identifying the series (BTreeMap for stable ordering).
     pub tags: BTreeMap<String, String>,
-    pub timestamp_ns: i64, // unix nanoseconds
+    /// Unix timestamp in nanoseconds.
+    pub timestamp_ns: i64,
+    /// Observed value.
     pub value: f64,
 }
 
@@ -21,11 +25,14 @@ pub struct DataPoint {
     Debug, Clone, Ord, PartialOrd, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
 pub struct SeriesKey {
+    /// Metric name component of the series identity.
     pub metric_name: String,
+    /// Complete tag set (BTreeMap ensures stable byte representation for hashing).
     pub tags: BTreeMap<String, String>,
 }
 
 impl SeriesKey {
+    /// Encodes the series key as canonical bytes: `metric_name,k1=v1,k2=v2` (tags in BTreeMap order).
     pub fn to_bytes(&self) -> Vec<u8> {
         let capacity = self.metric_name.len()
             + self
@@ -44,6 +51,7 @@ impl SeriesKey {
         buf
     }
 
+    /// Decodes a series key from the canonical byte format produced by `to_bytes`.
     pub fn from_bytes(bytes: &[u8]) -> anyhow::Result<Self> {
         let s = std::str::from_utf8(bytes)
             .map_err(|e| anyhow::anyhow!("invalid UTF-8 in series key: {e}"))?;
@@ -69,6 +77,7 @@ impl From<&SeriesKey> for SeriesId {
     }
 }
 
+/// Computes the `SeriesId` for a (metric_name, tags) pair without allocating a `SeriesKey`.
 pub fn series_id_from_parts(metric_name: &str, tags: &BTreeMap<String, String>) -> SeriesId {
     let mut h = xxhash_rust::xxh64::Xxh64::new(0);
     h.update(metric_name.as_bytes());
@@ -99,11 +108,16 @@ pub type Sequence = u64;
 /// with its own time range and column footprint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeriesChunkEntry {
+    /// Chunk file containing this series.
     pub chunk_id: ChunkId,
+    /// Series this entry belongs to.
     pub series_id: SeriesId,
-    pub time_start_ns: i64, // this series' earliest timestamp in this chunk
-    pub time_end_ns: i64,   // this series' latest timestamp in this chunk
-    pub size_bytes: usize,  // byte footprint of this series' columns in the file
+    /// Earliest timestamp for this series in this chunk.
+    pub time_start_ns: i64,
+    /// Latest timestamp for this series in this chunk.
+    pub time_end_ns: i64,
+    /// Byte footprint of this series' compressed columns in the file.
+    pub size_bytes: usize,
 }
 
 /// Value statistics for one series within one chunk — used for predicate pushdown.
@@ -111,12 +125,16 @@ pub struct SeriesChunkEntry {
 /// Series-level: min/max reflect only this series' values, not the whole file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SeriesChunkStats {
+    /// Minimum observed value for this series in this chunk.
     pub min_value: f64,
+    /// Maximum observed value for this series in this chunk.
     pub max_value: f64,
-    pub null_count: u64, // reserved for future nullable value support
+    /// Reserved for future nullable value support — always 0 today.
+    pub null_count: u64,
 }
 
 impl SeriesChunkStats {
+    /// Computes min/max stats from a value slice. Returns `None` if `values` is empty.
     pub fn from_values(values: &[f64]) -> Option<Self> {
         let min = values.iter().cloned().reduce(f64::min)?;
         let max = values.iter().cloned().reduce(f64::max)?;
@@ -133,17 +151,25 @@ impl SeriesChunkStats {
 /// Used by the compaction worker to locate files and group them by size.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ChunkMeta {
+    /// Absolute path to the `.mcs` file.
     pub file_path: PathBuf,
+    /// Total file size in bytes — used by the compaction worker for size-tier grouping.
     pub file_size: u64,
 }
 
+/// Filter applied during chunk and memtable reads to eliminate non-matching points.
+#[derive(Debug)]
 pub enum ValuePredicate {
+    /// Matches series/points where values exceed the threshold.
     GreaterThan(f64),
+    /// Matches series/points where values are below the threshold.
     LessThan(f64),
+    /// Matches series/points where values fall within `[lo, hi]`.
     Between(f64, f64),
 }
 
 impl ValuePredicate {
+    /// Returns `true` if a chunk with `[min_val, max_val]` can contain matching points (for pruning).
     pub fn matches(&self, min_val: f64, max_val: f64) -> bool {
         match self {
             Self::GreaterThan(t) => max_val > *t,
@@ -152,6 +178,7 @@ impl ValuePredicate {
         }
     }
 
+    /// Returns `true` if a single `value` satisfies this predicate (for point filtering).
     pub fn satisfies(&self, value: f64) -> bool {
         match self {
             Self::GreaterThan(t) => value > *t,
