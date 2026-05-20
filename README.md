@@ -111,7 +111,7 @@ Phase 1 (Rust storage engine) is complete. Phases 2–3 (Go ingestion and query 
   │      ├─ shard_watermarks[i].store(wal.current_sequence(), Release)         │
   │      └─ wals[i].drain_completed_before(persisted_watermarks[i])  ──► GC    │
   │                                                                            │
-  │  Snapshot worker  (every 60s)                                              │
+  │  Snapshot worker  (every N secs · MICIUS_INDEX_SNAPSHOT_INTERVAL_SECS)    │
   │      shard_watermarks[i].load(Acquire) × 16  +  ChunkIndex  ──► index.bin  │
   │      persisted_watermarks[i].store(w, Release)  (after save_index fsync)   │
   │      WAL GC for covered segments unblocked on the next sweep               │
@@ -167,7 +167,7 @@ Every `Append` RPC waits for the WAL group commit task to call `fsync` before re
 
 **WAL GC safety: gated on snapshot durability**
 
-A subtle durability gap exists between flush and snapshot. After the periodic sweep flushes a shard to a chunk file and registers it in the in-memory `ChunkIndex`, the chunk is durably on disk — but the index snapshot may not have been saved yet (the snapshot task fires every 60s). If WAL GC ran immediately using the live `shard_watermarks`, it would delete the segments that produced that chunk. A crash before the next snapshot would leave the chunk orphaned: invisible to the next startup because the loaded index doesn't know it exists, and with no WAL left to reconstruct it. Data silently lost.
+A subtle durability gap exists between flush and snapshot. After the periodic sweep flushes a shard to a chunk file and registers it in the in-memory `ChunkIndex`, the chunk is durably on disk — but the index snapshot may not have been saved yet (the snapshot task fires every `MICIUS_INDEX_SNAPSHOT_INTERVAL_SECS` seconds, default 60). If WAL GC ran immediately using the live `shard_watermarks`, it would delete the segments that produced that chunk. A crash before the next snapshot would leave the chunk orphaned: invisible to the next startup because the loaded index doesn't know it exists, and with no WAL left to reconstruct it. Data silently lost.
 
 The fix is `persisted_watermarks` — a second `Vec<Arc<AtomicU64>>` that only advances when `save_index()` returns `Ok`. WAL GC uses `persisted_watermarks` (via `Acquire` load), not `shard_watermarks`. Until a snapshot durably records a chunk in the index, the WAL segments that produced it are retained on disk:
 

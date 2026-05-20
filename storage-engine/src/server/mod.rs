@@ -530,7 +530,7 @@ impl StorageServer {
     ///  │                                                                     │
     ///  │  ┌─────────────────┐  ┌─────────────────┐  ┌──────────────────────┐ │
     ///  │  │ WAL group commit│  │ Compaction task │  │   Snapshot task      │ │
-    ///  │  │   continuous    │  │  every N secs   │  │   every 60 secs      │ │
+    ///  │  │   continuous    │  │  every N secs   │  │   every N secs       │ │
     ///  │  │  WalSender ch.  │  │ Mutex<Compact>  │  │ RwLock<ChunkIdx>read │ │
     ///  │  └────────┬────────┘  └────────┬────────┘  └──────────┬───────────┘ │
     ///  │           │                    │                      │             │
@@ -538,7 +538,7 @@ impl StorageServer {
     ///  │  │              Arc shared state                                  │ │
     ///  │  │  WalSender · Vec<Arc<Mutex<Memtable>>> · Arc<RwLock<ChunkIdx>> │ │
     ///  │  Arc<ChunkWriter> · Vec<Arc<AtomicU64>> (live + persisted wmarks) │ │
-    ///  └────────────────────────────────────────────────────────────────────┘ │
+    ///  └───────────────────────────────────────────────────────────────────┘ │
     ///  │           │                                                         │
     ///  │  ┌────────┴───────────────────────────────────────────────────────┐ │
     ///  │  │  Memtable sweep + WAL GC  (every 200ms)                        │ │
@@ -576,7 +576,7 @@ impl StorageServer {
             }
         });
 
-        // Periodic index snapshot — saves every 60 seconds.
+        // Periodic index snapshot — saves every index_snapshot_interval_secs.
         // WAL sequence is read first (lock acquired + released at semicolon, no binding),
         // then the index read lock is acquired for serialisation. Two locks are never
         // held simultaneously, avoiding contention with the flush write path.
@@ -587,8 +587,9 @@ impl StorageServer {
             let persisted: Vec<Arc<AtomicU64>> =
                 self.persisted_watermarks.iter().map(Arc::clone).collect();
             let index_path = self.snapshot_path.clone();
+            let snapshot_interval_secs = config.index_snapshot_interval_secs;
             tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(Duration::from_secs(60));
+                let mut ticker = tokio::time::interval(Duration::from_secs(snapshot_interval_secs));
                 loop {
                     ticker.tick().await;
                     let current_watermarks: Vec<u64> = watermarks
