@@ -21,6 +21,7 @@ struct IndexSnapshot {
     chunk_files: Vec<(ChunkId, ChunkMeta)>,
 }
 
+/// Serializes the index and shard watermarks to `path` atomically (write to `.tmp`, then rename).
 pub async fn save_index(index: &ChunkIndex, path: &Path, shard_watermarks: &[u64]) -> Result<()> {
     let snapshot = IndexSnapshot {
         version: 2,
@@ -64,6 +65,7 @@ pub async fn save_index(index: &ChunkIndex, path: &Path, shard_watermarks: &[u64
     Ok(())
 }
 
+/// Loads an index snapshot from `path`. Returns `None` if the file is absent, corrupt, or version-mismatched.
 pub async fn load_index(path: &Path) -> Result<Option<ChunkIndex>> {
     if !path.exists() {
         return Ok(None);

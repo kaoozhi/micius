@@ -9,21 +9,32 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::{mpsc, oneshot};
 
+/// Messages sent from RPC handlers to the per-shard WAL background task.
+#[derive(Debug)]
 pub enum WalMessage {
+    /// Write a batch of points and reply with the assigned sequence number.
     Append {
+        /// Points to append.
         points: Arc<Vec<DataPoint>>,
+        /// Channel to send the sequence number (or error) back to the caller.
         reply: oneshot::Sender<Result<Sequence>>,
     },
+    /// Force-rotate the current segment and drain completed segments.
     Rotate {
+        /// Channel to return the list of rotated segment paths.
         reply: oneshot::Sender<Result<Vec<PathBuf>>>,
     },
+    /// Drain segments whose max sequence is ≤ `seq` (WAL GC after flush).
     DrainBefore {
+        /// Sequence threshold — segments at or below this are eligible for deletion.
         seq: Sequence,
+        /// Channel to return the list of deleted segment paths.
         reply: oneshot::Sender<Result<Vec<PathBuf>>>,
     },
 }
 
-#[derive(Clone)]
+/// Client handle for a per-shard WAL background task.
+#[derive(Debug, Clone)]
 pub struct WalSender {
     tx: mpsc::Sender<WalMessage>,
     /// Last sequence number successfully fsynced. Updated atomically after
@@ -32,6 +43,7 @@ pub struct WalSender {
 }
 
 impl WalSender {
+    /// Sends points to the WAL task and waits for the fsync'd sequence number.
     pub async fn append(&self, points: Arc<Vec<DataPoint>>) -> Result<Sequence> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -46,6 +58,7 @@ impl WalSender {
             .map_err(|_| anyhow::anyhow!("WAL task dropped reply"))?
     }
 
+    /// Rotates the current WAL segment and returns paths of all completed segments.
     pub async fn rotate_and_drain(&self) -> Result<Vec<PathBuf>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -57,6 +70,7 @@ impl WalSender {
             .map_err(|_| anyhow::anyhow!("WAL task dropped reply"))?
     }
 
+    /// Instructs the WAL task to delete segments whose max sequence is ≤ `seq`.
     pub async fn drain_completed_before(&self, seq: Sequence) -> Result<Vec<PathBuf>> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
@@ -71,6 +85,7 @@ impl WalSender {
             .map_err(|_| anyhow::anyhow!("WAL task dropped reply"))?
     }
 
+    /// Spawns the WAL background task and returns the sender handle.
     pub fn spawn(
         writer: WalWriter,
         capacity: usize,
@@ -149,7 +164,9 @@ async fn wal_task(
                     if rotate_reply.is_none() {
                         rotate_reply = Some(reply);
                     } else {
-                        let _ = reply.send(Err(anyhow::anyhow!("concurrent Rotate in same batch")));
+                        reply
+                            .send(Err(anyhow::anyhow!("concurrent Rotate in same batch")))
+                            .ok();
                     }
                 }
                 WalMessage::DrainBefore { seq, reply } => {
@@ -177,7 +194,7 @@ async fn wal_task(
                     last_seq.store(max_seq, Ordering::Release);
                 }
                 for (seq, reply) in seqs.into_iter().zip(replies) {
-                    let _ = reply.send(Ok(seq));
+                    reply.send(Ok(seq)).ok();
                 }
                 if writer.current_size >= writer.max_segment_bytes
                     && let Err(e) = writer.rotate().await
@@ -187,10 +204,10 @@ async fn wal_task(
 
                 // handle explicit periodic sweep request
                 if !drain_replies.is_empty() {
-                    let max_seq = drain_replies.iter().map(|(seq, _)| *seq).max().unwrap();
+                    let max_seq = drain_replies.iter().map(|(seq, _)| *seq).max().unwrap_or(0);
                     let paths = writer.drain_completed_before(max_seq);
                     for (_, reply) in drain_replies {
-                        let _ = reply.send(Ok(paths.clone()));
+                        reply.send(Ok(paths.clone())).ok();
                     }
                 }
 
@@ -200,20 +217,24 @@ async fn wal_task(
                         .rotate()
                         .await
                         .map(|_| writer.drain_completed_before(u64::MAX));
-                    let _ = rotate.send(result);
+                    rotate.send(result).ok();
                 }
             }
 
             Err(e) => {
                 let msg = e.to_string();
                 for reply in replies {
-                    let _ = reply.send(Err(anyhow::anyhow!("{}", msg)));
+                    reply.send(Err(anyhow::anyhow!("{}", msg))).ok();
                 }
                 for (_, reply) in drain_replies {
-                    let _ = reply.send(Err(anyhow::anyhow!("WAL write failed: {}", msg)));
+                    reply
+                        .send(Err(anyhow::anyhow!("WAL write failed: {}", msg)))
+                        .ok();
                 }
                 if let Some(rotate) = rotate_reply {
-                    let _ = rotate.send(Err(anyhow::anyhow!("WAL write failed: {}", msg)));
+                    rotate
+                        .send(Err(anyhow::anyhow!("WAL write failed: {}", msg)))
+                        .ok();
                 }
             }
         }

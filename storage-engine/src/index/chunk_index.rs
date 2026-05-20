@@ -1,12 +1,17 @@
 use crate::types::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-#[derive(Default)]
+/// In-memory index over all chunk files — resolves series, prunes chunks, tracks watermarks.
+#[derive(Default, Debug)]
 pub struct ChunkIndex {
-    pub series_registry: HashMap<SeriesId, SeriesKey>, // Reverse map between SeriesId and SeriesKey, for O(1) metric-name lookup during query filtering
-    pub time_index: HashMap<SeriesId, BTreeMap<i64, SeriesChunkEntry>>, // a sorted map from chunk start time to chunk metadata per SeriesID
-    pub tag_index: HashMap<(String, String), HashSet<SeriesId>>, // Inverted tag index (tag key, tag value) map with SeriesID
-    pub chunk_stats: HashMap<(ChunkId, SeriesId), SeriesChunkStats>, // Chunk stats map per ChunkID
+    /// Maps `SeriesId → SeriesKey` for O(1) metric-name lookup during query filtering.
+    pub series_registry: HashMap<SeriesId, SeriesKey>,
+    /// Per-series sorted map from `time_start_ns → SeriesChunkEntry` for time-range pruning.
+    pub time_index: HashMap<SeriesId, BTreeMap<i64, SeriesChunkEntry>>,
+    /// Inverted tag index: `(tag_key, tag_value) → set of SeriesId` for multi-tag intersection.
+    pub tag_index: HashMap<(String, String), HashSet<SeriesId>>,
+    /// Per-(ChunkId, SeriesId) value statistics for predicate pushdown.
+    pub chunk_stats: HashMap<(ChunkId, SeriesId), SeriesChunkStats>,
     /// File sizes keyed by ChunkId — used by the compaction worker to group
     /// chunks by size without opening any files.
     pub chunk_files: HashMap<ChunkId, ChunkMeta>, // Chunk size map per ChunkID
@@ -18,6 +23,7 @@ pub struct ChunkIndex {
 }
 
 impl ChunkIndex {
+    /// Creates an empty index (used on first start when no snapshot exists).
     pub fn new() -> Self {
         Self::default()
     }
@@ -181,6 +187,7 @@ impl ChunkIndex {
             .collect()
     }
 
+    /// Number of distinct series registered in the index.
     pub fn series_count(&self) -> usize {
         self.series_registry.len()
     }

@@ -99,22 +99,31 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use tokio::io::AsyncWriteExt;
 
-#[derive(Default)]
+/// Writes a batch of series data to a single immutable `.mcs` chunk file.
+#[derive(Default, Debug)]
 pub struct ChunkWriter {
     chunk_dir: PathBuf,
 }
 
-/// Result of writing a chunk — one entry per series
+/// Result of writing a chunk — chunk-level metadata plus per-series index entries.
+#[derive(Debug)]
 pub struct ChunkWriteResult {
+    /// Identifier of the newly created chunk.
     pub chunk_id: ChunkId,
+    /// File path and size of the written chunk.
     pub chunk_meta: ChunkMeta,
-    /// Per-series metadata for registering in the ChunkIndex
+    /// Per-series metadata for registering in the ChunkIndex.
     pub series_results: Vec<SeriesWriteResult>,
 }
 
+/// Index registration data for a single series written into a chunk.
+#[derive(Debug)]
 pub struct SeriesWriteResult {
+    /// The series this result belongs to.
     pub series_key: SeriesKey,
+    /// Time range and size entry for the chunk index.
     pub entry: SeriesChunkEntry,
+    /// Min/max statistics for predicate pushdown.
     pub stats: SeriesChunkStats,
 }
 
@@ -143,12 +152,15 @@ fn build_directory_entry(s: &EncodedSeries, ts_offset: u64, val_offset: u64) -> 
 }
 
 impl ChunkWriter {
+    /// Creates a new `ChunkWriter` that stores chunk files in `dir`.
     pub fn new(dir: impl Into<PathBuf>) -> Self {
         ChunkWriter {
             chunk_dir: dir.into(),
         }
     }
 
+    /// Encodes and writes `series_data` to a new chunk file, returning index metadata.
+    #[allow(clippy::indexing_slicing)] // timestamps[0]/[len-1]: only reached when !points.is_empty(); offsets[i]: same length as encoded (enumerate)
     pub async fn write(
         &self,
         series_data: BTreeMap<SeriesKey, Vec<(i64, f64)>>,

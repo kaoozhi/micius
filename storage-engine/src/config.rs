@@ -3,6 +3,8 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+/// Runtime configuration loaded from environment variables.
+#[derive(Debug)]
 pub struct StorageConfig {
     /// Directory for WAL segment files
     pub wal_dir: PathBuf,
@@ -44,6 +46,9 @@ pub struct StorageConfig {
     /// corresponding series. Keeping them 1:1 makes per-shard WAL GC correct and cheap.
     pub num_shards: usize,
 
+    /// Index snapshot persisted to disk every this many seconds (default 60)
+    pub index_snapshot_interval_secs: u64,
+
     /// Compaction runs every this many seconds (default 300)
     pub compaction_interval_secs: u64,
 
@@ -61,6 +66,7 @@ pub struct StorageConfig {
 }
 
 impl StorageConfig {
+    /// Loads configuration from environment variables, falling back to defaults.
     pub fn load() -> Result<Self> {
         let num_shards = env_usize("MICIUS_NUM_SHARDS", 16);
         anyhow::ensure!(
@@ -77,6 +83,7 @@ impl StorageConfig {
             memtable_flush_threshold_bytes: env_usize("MICIUS_MEMTABLE_FLUSH_MB", 32) * 1024 * 1024,
             num_shards,
             wal_batch_delay_us: env_u64("MICIUS_WAL_BATCH_DELAY_US", 0),
+            index_snapshot_interval_secs: env_u64("MICIUS_INDEX_SNAPSHOT_INTERVAL_SECS", 60),
             compaction_interval_secs: env_u64("MICIUS_COMPACTION_INTERVAL_SECS", 300),
             compaction_min_threshold: env_usize("MICIUS_COMPACTION_MIN_THRESHOLD", 4),
             compaction_size_ratio: env_f64("MICIUS_COMPACTION_SIZE_RATIO", 1.5),
@@ -85,6 +92,7 @@ impl StorageConfig {
         })
     }
 
+    /// Creates WAL shard directories, chunk directory, and index parent directory if missing.
     pub async fn ensure_dirs(&self) -> Result<()> {
         tokio::fs::create_dir_all(&self.wal_dir).await?;
         for i in 0..self.num_shards {
@@ -130,6 +138,7 @@ fn env_string(key: &str, default: &str) -> String {
 }
 
 #[cfg(test)]
+#[allow(unsafe_code)]
 mod tests {
     use super::*;
 
