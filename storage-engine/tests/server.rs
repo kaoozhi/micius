@@ -42,6 +42,7 @@ fn test_config(dir: &TempDir) -> StorageConfig {
         wal_batch_delay_us: 0,
         memtable_flush_threshold_bytes: 32 * 1024 * 1024,
         num_shards: 16,
+        index_snapshot_interval_secs: 60,
         compaction_interval_secs: 300,
         compaction_min_threshold: 2,
         compaction_size_ratio: 2.0,
